@@ -3,6 +3,8 @@ package dhellman
 import (
 	"bytes"
 	"testing"
+
+	"github.com/nova-chat/novaproto/serializer"
 )
 
 func TestHandshakeRoundtrip(t *testing.T) {
@@ -15,25 +17,31 @@ func TestHandshakeRoundtrip(t *testing.T) {
 		t.Fatalf("bob GenerateKeyPair: %v", err)
 	}
 
-	aliceHello, err := NewHelloMessage(alice)
+	aliceHello := NewHelloMessage(alice)
+	bobHello := NewHelloMessage(bob)
+
+	aliceWire, err := serializer.Marshal(aliceHello)
 	if err != nil {
-		t.Fatalf("alice NewHelloMessage: %v", err)
+		t.Fatalf("alice Marshal: %v", err)
 	}
-	bobHello, err := NewHelloMessage(bob)
+	bobWire, err := serializer.Marshal(bobHello)
 	if err != nil {
-		t.Fatalf("bob NewHelloMessage: %v", err)
+		t.Fatalf("bob Marshal: %v", err)
 	}
 
-	aliceWire := aliceHello.Marshal()
-	bobWire := bobHello.Marshal()
-
-	gotBob, err := UnmarshalHello(bobWire)
-	if err != nil {
-		t.Fatalf("alice UnmarshalHello: %v", err)
+	var gotBob HelloMessage
+	if err := serializer.Unmarshal(bobWire, &gotBob); err != nil {
+		t.Fatalf("alice Unmarshal: %v", err)
 	}
-	gotAlice, err := UnmarshalHello(aliceWire)
-	if err != nil {
-		t.Fatalf("bob UnmarshalHello: %v", err)
+	if gotBob.Version != HelloVersion {
+		t.Fatalf("gotBob version: got %d, want %d", gotBob.Version, HelloVersion)
+	}
+	var gotAlice HelloMessage
+	if err := serializer.Unmarshal(aliceWire, &gotAlice); err != nil {
+		t.Fatalf("bob Unmarshal: %v", err)
+	}
+	if gotAlice.Version != HelloVersion {
+		t.Fatalf("gotAlice version: got %d, want %d", gotAlice.Version, HelloVersion)
 	}
 
 	aliceShared, err := alice.ComputeShared(gotBob.PublicKey)
@@ -48,7 +56,7 @@ func TestHandshakeRoundtrip(t *testing.T) {
 		t.Fatal("shared secrets differ")
 	}
 
-	salt := append(append([]byte{}, aliceHello.Nonce[:]...), bobHello.Nonce[:]...)
+	salt := append(append([]byte{}, aliceHello.PublicKey[:]...), bobHello.PublicKey[:]...)
 	info := []byte("novaproto/dhellman/test")
 
 	aliceKey, err := DeriveKey(aliceShared, salt, info)
@@ -64,20 +72,6 @@ func TestHandshakeRoundtrip(t *testing.T) {
 	}
 	if len(aliceKey) != SharedKeySize {
 		t.Fatalf("derived key size: got %d, want %d", len(aliceKey), SharedKeySize)
-	}
-}
-
-func TestUnmarshalHelloRejectsBadInput(t *testing.T) {
-	if _, err := UnmarshalHello(nil); err == nil {
-		t.Error("accepted nil")
-	}
-	if _, err := UnmarshalHello(make([]byte, helloSize-1)); err == nil {
-		t.Error("accepted short buffer")
-	}
-	bad := make([]byte, helloSize)
-	bad[1] = 0xFF
-	if _, err := UnmarshalHello(bad); err == nil {
-		t.Error("accepted unknown version")
 	}
 }
 

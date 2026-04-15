@@ -3,9 +3,13 @@
 //
 // Supported kinds: bool, all fixed-size integer types (int8..int64,
 // uint8..uint64), int, uint, float32, float64, string, array, slice,
-// struct (exported fields only). Byte slices and byte arrays are handled
-// on a fast path. Pointers, maps, interfaces, channels, and functions are
-// NOT supported — the encoder returns ErrUnsupportedKind for them.
+// struct (exported fields only), pointer to any supported kind. Byte
+// slices and byte arrays are handled on a fast path. Maps, interfaces,
+// channels, and functions are NOT supported — the encoder returns
+// ErrUnsupportedKind for them. Nil pointers cannot be encoded (wire
+// format has no nil marker); the encoder returns ErrNilPointer. On
+// decode, nil destination pointers inside a value are allocated
+// automatically.
 //
 // Wire format: all multi-byte integers are big-endian. Variable-length
 // values (string, slice) are prefixed with a uint32 length. Structs are
@@ -129,6 +133,12 @@ func encodeValue(buf []byte, v reflect.Value) ([]byte, error) {
 				return nil, err
 			}
 		}
+
+	case reflect.Ptr:
+		if v.IsNil() {
+			return nil, ErrNilPointer
+		}
+		return encodeValue(buf, v.Elem())
 
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedKind, v.Kind())
@@ -278,6 +288,12 @@ func decodeValue(data []byte, v reflect.Value) ([]byte, error) {
 				return nil, err
 			}
 		}
+
+	case reflect.Ptr:
+		if v.IsNil() {
+			v.Set(reflect.New(v.Type().Elem()))
+		}
+		return decodeValue(data, v.Elem())
 
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedKind, v.Kind())

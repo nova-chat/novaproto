@@ -162,3 +162,49 @@ func TestUnsupportedKindRejected(t *testing.T) {
 		t.Errorf("expected ErrUnsupportedKind, got %v", err)
 	}
 }
+
+func TestPointerRoundtrip(t *testing.T) {
+	type Inner struct {
+		A int32
+		B string
+	}
+	in := &Inner{A: 42, B: "hello"}
+	b, err := Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal pointer: %v", err)
+	}
+
+	// Decoding into a non-nil pointer reuses the existing target.
+	out := &Inner{}
+	if err := Unmarshal(b, &out); err != nil {
+		t.Fatalf("Unmarshal pointer: %v", err)
+	}
+	if !reflect.DeepEqual(in, out) {
+		t.Errorf("pointer roundtrip mismatch:\n  got:  %+v\n  want: %+v", out, in)
+	}
+
+	// Decoding into a nil pointer allocates.
+	var nilOut *Inner
+	if err := Unmarshal(b, &nilOut); err != nil {
+		t.Fatalf("Unmarshal into nil pointer: %v", err)
+	}
+	if !reflect.DeepEqual(in, nilOut) {
+		t.Errorf("nil-pointer roundtrip mismatch:\n  got:  %+v\n  want: %+v", nilOut, in)
+	}
+
+	// Wire format must match the by-value form byte-for-byte.
+	byVal, err := Marshal(*in)
+	if err != nil {
+		t.Fatalf("Marshal value: %v", err)
+	}
+	if !bytes.Equal(b, byVal) {
+		t.Errorf("pointer and value forms differ:\n  ptr: %x\n  val: %x", b, byVal)
+	}
+}
+
+func TestMarshalNilPointerRejected(t *testing.T) {
+	var p *int32
+	if _, err := Marshal(p); !errors.Is(err, ErrNilPointer) {
+		t.Errorf("expected ErrNilPointer, got %v", err)
+	}
+}
