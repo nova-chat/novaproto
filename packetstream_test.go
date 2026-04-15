@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -186,4 +187,164 @@ func TestPacketStreamEOF(t *testing.T) {
 		t.Errorf("expected EOF-ish error, got %v", err)
 	}
 	_ = b.Close()
+}
+
+// TestPacketStreamConcurrentSends fires N goroutines each opening
+// their own packet via SendPacket and writing a unique payload. The
+// receiver picks up all N readers, drains them in parallel goroutines
+// (per-packet drain is required to avoid head-of-line blocking under
+// multiplexed sends), and verifies every payload arrived intact.
+func TestPacketStreamConcurrentSends(t *testing.T) {
+	client, server, cleanup := pipePacketStreams(t)
+	defer cleanup()
+
+	const N = 50
+
+	var sendWg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		sendWg.Add(1)
+		go func(i int) {
+			defer sendWg.Done()
+			w := client.SendPacket()
+			payload := []byte(fmt.Sprintf("packet-%04d", i))
+			if _, err := w.Write(payload); err != nil {
+				t.Errorf("[%d] Write: %v", i, err)
+				return
+			}
+			if err := w.Close(); err != nil {
+				t.Errorf("[%d] Close: %v", i, err)
+			}
+		}(i)
+	}
+
+	received := make(chan string, N)
+	var recvWg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		r, err := server.ReceivePacket()
+		if err != nil {
+			t.Fatalf("ReceivePacket: %v", err)
+		}
+		recvWg.Add(1)
+		go func(r io.Reader) {
+			defer recvWg.Done()
+			got, err := io.ReadAll(r)
+			if err != nil {
+				t.Errorf("ReadAll: %v", err)
+				return
+			}
+			received <- string(got)
+		}(r)
+	}
+	sendWg.Wait()
+	recvWg.Wait()
+	close(received)
+
+	seen := make(map[string]bool, N)
+	for s := range received {
+		seen[s] = true
+	}
+	if len(seen) != N {
+		t.Errorf("got %d distinct packets, want %d", len(seen), N)
+	}
+	for i := 0; i < N; i++ {
+		want := fmt.Sprintf("packet-%04d", i)
+		if !seen[want] {
+			t.Errorf("missing %q", want)
+		}
+	}
+}
+
+// TestPacketStreamConcurrentLargeAndSmall sends one big multi-frame
+// packet and several small single-frame packets concurrently from
+// independent goroutines. Verifies that small packets aren't blocked
+// behind the big one — frames of different packets interleave on the
+// wire and demultiplex correctly on the receive side.
+func TestPacketStreamConcurrentLargeAndSmall(t *testing.T) {
+	client, server, cleanup := pipePacketStreams(t)
+	defer cleanup()
+
+	const largeSize = 4 * 1024 * 1024
+	largePayload := make([]byte, largeSize)
+	if _, err := rand.Read(largePayload); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	smalls := []string{"alpha", "beta", "gamma", "delta", "epsilon"}
+
+	var sendWg sync.WaitGroup
+	sendWg.Add(2)
+	go func() {
+		defer sendWg.Done()
+		w := client.SendPacket()
+		if _, err := io.Copy(w, bytes.NewReader(largePayload)); err != nil {
+			t.Errorf("large copy: %v", err)
+			return
+		}
+		if err := w.Close(); err != nil {
+			t.Errorf("large close: %v", err)
+		}
+	}()
+	go func() {
+		defer sendWg.Done()
+		for _, s := range smalls {
+			w := client.SendPacket()
+			if _, err := w.Write([]byte(s)); err != nil {
+				t.Errorf("small write: %v", err)
+				return
+			}
+			if err := w.Close(); err != nil {
+				t.Errorf("small close: %v", err)
+				return
+			}
+		}
+	}()
+
+	type result struct {
+		payload []byte
+		large   bool
+	}
+	total := 1 + len(smalls)
+	resCh := make(chan result, total)
+
+	var recvWg sync.WaitGroup
+	for i := 0; i < total; i++ {
+		r, err := server.ReceivePacket()
+		if err != nil {
+			t.Fatalf("ReceivePacket: %v", err)
+		}
+		recvWg.Add(1)
+		go func(r io.Reader) {
+			defer recvWg.Done()
+			got, err := io.ReadAll(r)
+			if err != nil {
+				t.Errorf("drain: %v", err)
+				return
+			}
+			resCh <- result{payload: got, large: len(got) == largeSize}
+		}(r)
+	}
+
+	sendWg.Wait()
+	recvWg.Wait()
+	close(resCh)
+
+	var gotLarge bool
+	seenSmalls := make(map[string]bool)
+	for r := range resCh {
+		if r.large {
+			if !bytes.Equal(r.payload, largePayload) {
+				t.Error("large payload mismatch")
+			}
+			gotLarge = true
+		} else {
+			seenSmalls[string(r.payload)] = true
+		}
+	}
+	if !gotLarge {
+		t.Error("missing large packet")
+	}
+	for _, s := range smalls {
+		if !seenSmalls[s] {
+			t.Errorf("missing small %q", s)
+		}
+	}
 }

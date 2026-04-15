@@ -12,36 +12,47 @@ import (
 // sequence of frames sharing one PacketNonce, terminated by a frame
 // with IsTerminating = true.
 //
-// Both directions are fully streaming:
+// Both directions support multiple in-flight packets simultaneously:
 //
-//	SendPacket()    returns an io.WriteCloser; each Write call chunks
-//	                the content into one or more frames (up to
-//	                MaxFrameSize) and writes them to the wire as the
-//	                caller produces bytes. Close() emits the empty
-//	                terminating frame and releases the send lock.
+//   - SendPacket may be called concurrently from many goroutines.
+//     Each call gets a fresh PacketNonce and an independent
+//     io.WriteCloser. Frames of different packets interleave on the
+//     wire (the Wire's own writeMu serializes individual frame writes,
+//     so frames stay atomic on the wire even though packets do not).
 //
-//	ReceivePacket() blocks until the next packet starts, then returns
-//	                an io.Reader. The reader yields the packet content
-//	                as frames arrive and returns io.EOF when the
-//	                terminating frame is seen. The underlying pipe
-//	                back-pressures the read worker, so a slow reader
-//	                throttles the wire instead of buffering in memory.
+//   - On the receive side, a single read worker demultiplexes incoming
+//     frames by PacketNonce so each in-flight packet's reader receives
+//     only its own bytes. ReceivePacket returns each new packet as it
+//     starts; callers typically spawn one goroutine per packet to
+//     drain readers in parallel.
 //
-// SendPacket is serialized: a second SendPacket blocks until the
-// previous WriteCloser is Closed. ReceivePacket must be drained to
-// io.EOF before calling it again — the read worker holds on the
-// current packet's pipe until the consumer reads it out.
+// Sending:
 //
-// Because PacketStream takes a Wire, it runs unchanged over a plain
-// NovaWireStream or a NovaWireStreamCipher — the encryption layer is
-// orthogonal. You can wrap a cipher after construction and subsequent
-// packets will be encrypted without touching PacketStream.
+//	w := ps.SendPacket()
+//	io.Copy(w, src) // streamed into wire frames as data is written
+//	w.Close()       // emits the empty terminating frame
+//
+// Receiving:
+//
+//	for {
+//	    r, err := ps.ReceivePacket()
+//	    if err != nil { ... }
+//	    go drain(r) // spawn per-packet drainer to avoid HoL blocking
+//	}
+//
+// Head-of-line blocking warning: the read worker writes incoming
+// frame content into a per-packet io.Pipe. If a consumer stops
+// reading one packet's reader, the pipe write blocks and stalls the
+// entire stream — no other packets can be processed until that
+// reader is drained or the wire errors out. ALWAYS drain returned
+// readers (or close them to signal you're done) and call
+// ReceivePacket promptly so new packets get picked up before the
+// channel buffer fills.
 type PacketStream struct {
 	wire Wire
 
-	// Send side.
-	sendMu  sync.Mutex    // held while a SendPacket writer is open
-	nextPkt atomic.Uint32 // outgoing PacketNonce counter
+	// Send side. nextPkt is the only state, accessed atomically.
+	nextPkt atomic.Uint32
 
 	// Receive side.
 	packets     chan *incomingPacket
@@ -49,22 +60,36 @@ type PacketStream struct {
 	startReader sync.Once
 }
 
+// incomingPacketBuffer is the depth of the queue of newly-arrived
+// packets waiting to be picked up by ReceivePacket. Larger means more
+// new packets can be absorbed before the read worker stalls on a
+// slow consumer; this only buffers channel slots, not packet content.
+const incomingPacketBuffer = 64
+
 // NewPacketStream wraps a Wire in a packet multiplexer. The read
 // worker is started lazily on the first ReceivePacket call, so a
 // write-only user pays no goroutine cost.
 func NewPacketStream(wire Wire) *PacketStream {
 	return &PacketStream{
 		wire:    wire,
-		packets: make(chan *incomingPacket, 1),
+		packets: make(chan *incomingPacket, incomingPacketBuffer),
 	}
 }
 
-// SendPacket returns an io.WriteCloser that streams one outgoing
-// packet. Close MUST be called to emit the terminating frame and
-// release the internal send lock; forgetting Close deadlocks the
-// next SendPacket.
+// SendPacket returns an io.WriteCloser for one outgoing packet. Safe
+// to call concurrently from multiple goroutines; each call returns a
+// distinct writer with a fresh PacketNonce, and writes from different
+// writers are independently framed and interleaved on the wire.
+//
+// Close MUST be called on every returned writer to emit the empty
+// terminating frame; forgetting Close orphans the packet on the
+// receiver side (its inflight entry stays alive until the wire
+// errors out).
+//
+// A single packetWriter is NOT safe for concurrent Write calls — if
+// you need parallel writes, use multiple packets, not multiple
+// writers on the same packet.
 func (ps *PacketStream) SendPacket() io.WriteCloser {
-	ps.sendMu.Lock()
 	return &packetWriter{
 		ps:          ps,
 		packetNonce: ps.nextPkt.Add(1),
@@ -74,10 +99,15 @@ func (ps *PacketStream) SendPacket() io.WriteCloser {
 // ReceivePacket blocks until the next incoming packet begins and
 // returns an io.Reader for its content. The reader yields bytes as
 // frames arrive and returns io.EOF when the terminating frame lands.
-// The previous reader must be drained to io.EOF before calling
-// ReceivePacket again.
 //
 // Returns the terminal wire error once the read worker has seen one.
+//
+// Multiple readers may exist simultaneously when the peer is
+// multiplexing — the typical pattern is one drain goroutine per
+// returned reader. Sequential drain (calling ReadAll inline before
+// the next ReceivePacket) is unsafe whenever the peer overlaps
+// packets, because pending frames for unsipped packets can deadlock
+// the read worker.
 func (ps *PacketStream) ReceivePacket() (io.Reader, error) {
 	ps.startReader.Do(func() { go ps.readLoop() })
 	pkt, ok := <-ps.packets
@@ -100,10 +130,7 @@ type packetWriter struct {
 }
 
 // Write chunks p into frames of at most MaxFrameSize-FrameHeaderSize
-// bytes and pushes them through the wire. Under a cipher wrapper,
-// the wire will reject oversized content (sealed size exceeds the
-// limit); callers that care about exact max-plain size can check the
-// cipher's overhead before calling.
+// bytes and pushes them through the wire.
 func (pw *packetWriter) Write(p []byte) (int, error) {
 	if pw.closed {
 		return 0, errors.New("packetstream: write on closed packet writer")
@@ -129,15 +156,14 @@ func (pw *packetWriter) Write(p []byte) (int, error) {
 	return written, nil
 }
 
-// Close sends the empty terminating frame and releases the stream's
-// send lock. Safe to call multiple times — only the first Close emits
-// the frame and unlocks.
+// Close sends the empty terminating frame so the receiver knows the
+// packet is complete. Safe to call multiple times — only the first
+// Close emits the frame.
 func (pw *packetWriter) Close() error {
 	if pw.closed {
 		return nil
 	}
 	pw.closed = true
-	defer pw.ps.sendMu.Unlock()
 
 	pw.frameNonce++
 	hdr := FrameHeader{
@@ -151,94 +177,85 @@ func (pw *packetWriter) Close() error {
 // --- receive side internals ------------------------------------------
 
 type incomingPacket struct {
-	reader      *io.PipeReader
-	writer      *io.PipeWriter
-	packetNonce uint32
+	reader         *io.PipeReader
+	writer         *io.PipeWriter
+	packetNonce    uint32
+	lastFrameNonce uint32
+	// discarding becomes true after the consumer's reader was closed
+	// early; subsequent frames for this packet are read off the wire
+	// but their content is dropped instead of being written into the
+	// (already-closed) pipe. The inflight entry is removed when the
+	// packet's terminating frame arrives.
+	discarding bool
 }
 
 func (ps *PacketStream) readLoop() {
 	defer close(ps.packets)
 
-	var current *incomingPacket
-	var lastFrameNonce uint32
+	inflight := make(map[uint32]*incomingPacket)
+
+	failAll := func(err error) {
+		ps.readErr.Store(&err)
+		for _, p := range inflight {
+			_ = p.writer.CloseWithError(err)
+		}
+	}
 
 	for {
 		hdr, content, err := ps.wire.ReadFrame()
 		if err != nil {
-			ps.readErr.Store(&err)
-			if current != nil {
-				_ = current.writer.CloseWithError(err)
-			}
+			failAll(err)
 			return
 		}
 
-		if current == nil {
-			// New packet begins here.
+		pkt, ok := inflight[hdr.PacketNonce]
+		if !ok {
+			// First frame of a new packet. Could be either a regular
+			// content frame or, for an empty packet, the terminating
+			// frame itself — handle both by creating the entry and
+			// pushing it to the consumer; the terminating-frame branch
+			// below then closes the pipe immediately on this same
+			// iteration.
 			pr, pw := io.Pipe()
-			current = &incomingPacket{
-				reader:      pr,
-				writer:      pw,
-				packetNonce: hdr.PacketNonce,
+			pkt = &incomingPacket{
+				reader:         pr,
+				writer:         pw,
+				packetNonce:    hdr.PacketNonce,
+				lastFrameNonce: hdr.FrameNonce,
 			}
-			lastFrameNonce = hdr.FrameNonce
-			// Hand the reader to ReceivePacket before we write into
-			// the pipe, otherwise Write blocks forever with no
-			// consumer attached.
-			ps.packets <- current
+			inflight[hdr.PacketNonce] = pkt
+			// Hand the reader to a consumer BEFORE writing into the
+			// pipe — otherwise the pipe write blocks with no consumer
+			// attached. If the packets channel is full the read loop
+			// stalls until ReceivePacket drains a slot.
+			ps.packets <- pkt
 		} else {
-			if hdr.PacketNonce != current.packetNonce {
-				err := fmt.Errorf("packetstream: packet nonce changed from %d to %d mid-packet",
-					current.packetNonce, hdr.PacketNonce)
-				_ = current.writer.CloseWithError(err)
-				ps.readErr.Store(&err)
+			if hdr.FrameNonce <= pkt.lastFrameNonce {
+				err := fmt.Errorf("packetstream: non-monotonic frame nonce %d after %d in packet %d",
+					hdr.FrameNonce, pkt.lastFrameNonce, hdr.PacketNonce)
+				failAll(err)
 				return
 			}
-			if hdr.FrameNonce <= lastFrameNonce {
-				err := fmt.Errorf("packetstream: non-monotonic frame nonce %d after %d",
-					hdr.FrameNonce, lastFrameNonce)
-				_ = current.writer.CloseWithError(err)
-				ps.readErr.Store(&err)
-				return
-			}
-			lastFrameNonce = hdr.FrameNonce
+			pkt.lastFrameNonce = hdr.FrameNonce
 		}
 
 		if hdr.IsTerminating {
-			_ = current.writer.Close()
-			current = nil
+			if !pkt.discarding {
+				_ = pkt.writer.Close()
+			}
+			delete(inflight, hdr.PacketNonce)
 			continue
 		}
 
-		if len(content) > 0 {
-			if _, err := current.writer.Write(content); err != nil {
-				// The consumer closed the reader early (lost interest
-				// in this packet). Drain the rest of the packet's
-				// frames from the wire, then move on.
-				if drainErr := ps.drainPacket(current.packetNonce); drainErr != nil {
-					ps.readErr.Store(&drainErr)
-					return
-				}
-				current = nil
+		if len(content) > 0 && !pkt.discarding {
+			if _, err := pkt.writer.Write(content); err != nil {
+				// Consumer closed the reader early. Switch the packet
+				// to discarding mode: keep its entry in inflight so
+				// subsequent frames are matched and dropped, until
+				// the terminating frame arrives and removes it.
+				pkt.discarding = true
+				_ = pkt.writer.CloseWithError(err)
 			}
-		}
-	}
-}
-
-// drainPacket reads and discards frames until the terminating frame of
-// the given packet nonce arrives. Called when the consumer closed the
-// reader early; keeps the wire in sync for the next packet.
-func (ps *PacketStream) drainPacket(nonce uint32) error {
-	for {
-		hdr, _, err := ps.wire.ReadFrame()
-		if err != nil {
-			return err
-		}
-		if hdr.PacketNonce != nonce {
-			return fmt.Errorf("packetstream: unexpected packet nonce %d while draining %d",
-				hdr.PacketNonce, nonce)
-		}
-		if hdr.IsTerminating {
-			return nil
 		}
 	}
 }
