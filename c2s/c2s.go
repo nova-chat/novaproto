@@ -23,21 +23,16 @@ import (
 	"github.com/nova-chat/novaproto/serializer"
 )
 
+// Header is an alias for the shared framing header defined in internal/frame.
+// It carries fragmentation info (FragmentNum / FragmentsCount) — see
+// frame.Header for full semantics.
+type Header = frame.Header
+
 // NovaServerPacket is the client↔server packet.
 type NovaServerPacket struct {
 	Header  Header
 	Meta    Metadata
 	Payload []byte
-}
-
-// Header carries c2s-level framing fields that live outside of Metadata.
-//
-// FragmentNum / FragmentsCount let the sender split one logical transport
-// message across multiple c2s frames so the receiver can reassemble them.
-// For unfragmented messages set FragmentsCount = 1 and FragmentNum = 0.
-type Header struct {
-	FragmentNum    int16
-	FragmentsCount int16
 }
 
 // Metadata is the c2s-layer routing metadata.
@@ -46,14 +41,6 @@ type Metadata struct {
 	TargetID    uuid.UUID
 	MessageType uint32
 	Timestamp   int64
-}
-
-// inner is the wire-format struct carried inside the encrypted (and plain)
-// region. Header and Metadata are serialized together via the serializer
-// package.
-type inner struct {
-	Header Header
-	Meta   Metadata
 }
 
 // Plain wire layout:
@@ -74,9 +61,6 @@ func NewCodec(key []byte, opts *novaproto.Options) (*Codec, error) {
 	return &Codec{frame: f}, nil
 }
 
-func (c *Codec) GetMagic() uint32   { return novaproto.Magic }
-func (c *Codec) GetVersion() uint32 { return novaproto.Version }
-
 // Encode serializes and encrypts a NovaServerPacket into a wire frame.
 func (c *Codec) Encode(pkt *NovaServerPacket) ([]byte, error) {
 	if pkt == nil {
@@ -85,7 +69,7 @@ func (c *Codec) Encode(pkt *NovaServerPacket) ([]byte, error) {
 	if pkt.Meta.Timestamp == 0 {
 		pkt.Meta.Timestamp = time.Now().UnixNano()
 	}
-	innerBytes, err := serializer.Marshal(&inner{Header: pkt.Header, Meta: pkt.Meta})
+	innerBytes, err := buildInner(&pkt.Header, &pkt.Meta)
 	if err != nil {
 		return nil, err
 	}
@@ -98,13 +82,13 @@ func (c *Codec) Decode(frameBytes []byte) (*NovaServerPacket, error) {
 	if err != nil {
 		return nil, err
 	}
-	var in inner
-	if err := serializer.Unmarshal(innerBytes, &in); err != nil {
+	header, meta, err := parseInner(innerBytes)
+	if err != nil {
 		return nil, err
 	}
 	return &NovaServerPacket{
-		Header:  in.Header,
-		Meta:    in.Meta,
+		Header:  *header,
+		Meta:    *meta,
 		Payload: payload,
 	}, nil
 }
@@ -133,7 +117,7 @@ func EncodePlain(pkt *NovaServerPacket) ([]byte, error) {
 		pkt.Meta.Timestamp = time.Now().UnixNano()
 	}
 
-	innerBytes, err := serializer.Marshal(&inner{Header: pkt.Header, Meta: pkt.Meta})
+	innerBytes, err := buildInner(&pkt.Header, &pkt.Meta)
 	if err != nil {
 		return nil, err
 	}
@@ -171,14 +155,38 @@ func DecodePlain(frameBytes []byte) (*NovaServerPacket, error) {
 		return nil, errors.New("c2s: plain length mismatch")
 	}
 
-	var in inner
-	if err := serializer.Unmarshal(frameBytes[plainHeaderLen:plainHeaderLen+int(innerLen)], &in); err != nil {
+	header, meta, err := parseInner(frameBytes[plainHeaderLen : plainHeaderLen+int(innerLen)])
+	if err != nil {
 		return nil, err
 	}
 	payload := append([]byte(nil), frameBytes[plainHeaderLen+int(innerLen):]...)
 	return &NovaServerPacket{
-		Header:  in.Header,
-		Meta:    in.Meta,
+		Header:  *header,
+		Meta:    *meta,
 		Payload: payload,
 	}, nil
+}
+
+func buildInner(h *Header, m *Metadata) ([]byte, error) {
+	headerBytes, err := h.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	metaBytes, err := serializer.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	return append(headerBytes, metaBytes...), nil
+}
+
+func parseInner(buf []byte) (*Header, *Metadata, error) {
+	header, metaBytes, err := frame.UnmarshalHeader(buf)
+	if err != nil {
+		return nil, nil, err
+	}
+	var meta Metadata
+	if err := serializer.Unmarshal(metaBytes, &meta); err != nil {
+		return nil, nil, err
+	}
+	return header, &meta, nil
 }

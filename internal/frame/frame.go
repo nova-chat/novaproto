@@ -18,9 +18,9 @@ import (
 )
 
 const (
-	nonceSize  = 12
-	HeaderSize = 24
-	obfsSize   = HeaderSize - nonceSize // 12 bytes XOR-obfuscated
+	nonceSize      = 12
+	wireHeaderSize = 24
+	obfsSize       = wireHeaderSize - nonceSize // 12 bytes XOR-obfuscated
 
 	offNonce   = 0
 	offMagic   = 12
@@ -96,7 +96,7 @@ func (c *Codec) Seal(meta, payload []byte) ([]byte, error) {
 		headerBuf[offMagic+i] ^= ks[i]
 	}
 
-	out := make([]byte, 1+c.prefixLen+HeaderSize+len(ct))
+	out := make([]byte, 1+c.prefixLen+wireHeaderSize+len(ct))
 	out[0] = byte(novaproto.FlagEncrypted)
 	if c.prefixLen > 0 {
 		if _, err := io.ReadFull(rand.Reader, out[1:1+c.prefixLen]); err != nil {
@@ -104,13 +104,13 @@ func (c *Codec) Seal(meta, payload []byte) ([]byte, error) {
 		}
 	}
 	copy(out[1+c.prefixLen:], headerBuf)
-	copy(out[1+c.prefixLen+HeaderSize:], ct)
+	copy(out[1+c.prefixLen+wireHeaderSize:], ct)
 	return out, nil
 }
 
 // Open reverses Seal and returns (meta, payload).
 func (c *Codec) Open(frame []byte) ([]byte, []byte, error) {
-	if len(frame) < 1+c.prefixLen+HeaderSize+c.aead.Overhead() {
+	if len(frame) < 1+c.prefixLen+wireHeaderSize+c.aead.Overhead() {
 		return nil, nil, errors.New("frame: too short")
 	}
 	if novaproto.Flag(frame[0]) != novaproto.FlagEncrypted {
@@ -118,8 +118,8 @@ func (c *Codec) Open(frame []byte) ([]byte, []byte, error) {
 	}
 	body := frame[1+c.prefixLen:]
 
-	headerBuf := make([]byte, HeaderSize)
-	copy(headerBuf, body[:HeaderSize])
+	headerBuf := make([]byte, wireHeaderSize)
+	copy(headerBuf, body[:wireHeaderSize])
 
 	ks := headerKeystream(c.obfsKey, headerBuf[offNonce:offNonce+nonceSize])
 	for i := 0; i < obfsSize; i++ {
@@ -135,12 +135,12 @@ func (c *Codec) Open(frame []byte) ([]byte, []byte, error) {
 		return nil, nil, errors.New("frame: unsupported version")
 	}
 	length := binary.BigEndian.Uint32(headerBuf[offLength:])
-	if int(length) != len(body)-HeaderSize {
+	if int(length) != len(body)-wireHeaderSize {
 		return nil, nil, errors.New("frame: length mismatch")
 	}
 
 	nonce := headerBuf[offNonce : offNonce+nonceSize]
-	pt, err := c.aead.Open(nil, nonce, body[HeaderSize:], headerBuf[offMagic:])
+	pt, err := c.aead.Open(nil, nonce, body[wireHeaderSize:], headerBuf[offMagic:])
 	if err != nil {
 		return nil, nil, err
 	}
@@ -148,7 +148,7 @@ func (c *Codec) Open(frame []byte) ([]byte, []byte, error) {
 }
 
 func marshalHeader(nonce []byte, length uint32) []byte {
-	buf := make([]byte, HeaderSize)
+	buf := make([]byte, wireHeaderSize)
 	copy(buf[offNonce:offNonce+nonceSize], nonce)
 	binary.BigEndian.PutUint32(buf[offMagic:], novaproto.Magic)
 	binary.BigEndian.PutUint32(buf[offVersion:], novaproto.Version)

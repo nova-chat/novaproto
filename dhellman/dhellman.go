@@ -30,9 +30,6 @@ import (
 const (
 	PublicKeySize = 32
 	SharedKeySize = 32
-
-	// HelloVersion is the current wire-format version of HelloMessage.
-	HelloVersion uint16 = 1
 )
 
 // KeyPair is an ephemeral X25519 keypair. The private half never leaves
@@ -86,17 +83,12 @@ func DeriveKey(shared, salt, info []byte) ([]byte, error) {
 // handshake. Both peers send one, carrying their ephemeral public key.
 // The wire format is produced by the serializer package — callers pass
 // *HelloMessage through serializer.Marshal / serializer.Unmarshal
-// directly and check Version themselves.
+// directly.
 type HelloMessage struct {
-	Version   uint16
 	PublicKey [PublicKeySize]byte
 }
 
-// NewHelloMessage builds a HelloMessage from the keypair's public half
-// with the current HelloVersion.
+// NewHelloMessage builds a HelloMessage from the keypair's public half.
 func NewHelloMessage(kp *KeyPair) *HelloMessage {
-	return &HelloMessage{
-		Version:   HelloVersion,
-		PublicKey: kp.PublicKey(),
-	}
+	return &HelloMessage{PublicKey: kp.PublicKey()}
 }

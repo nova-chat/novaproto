@@ -29,9 +29,6 @@ func TestRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCodec: %v", err)
 	}
-	if c.GetMagic() != novaproto.Magic {
-		t.Errorf("magic: got %#x, want %#x", c.GetMagic(), novaproto.Magic)
-	}
 
 	pkt := &NovaServerPacket{
 		Meta: Metadata{

@@ -33,15 +33,9 @@ func TestHandshakeRoundtrip(t *testing.T) {
 	if err := serializer.Unmarshal(bobWire, &gotBob); err != nil {
 		t.Fatalf("alice Unmarshal: %v", err)
 	}
-	if gotBob.Version != HelloVersion {
-		t.Fatalf("gotBob version: got %d, want %d", gotBob.Version, HelloVersion)
-	}
 	var gotAlice HelloMessage
 	if err := serializer.Unmarshal(aliceWire, &gotAlice); err != nil {
 		t.Fatalf("bob Unmarshal: %v", err)
-	}
-	if gotAlice.Version != HelloVersion {
-		t.Fatalf("gotAlice version: got %d, want %d", gotAlice.Version, HelloVersion)
 	}
 
 	aliceShared, err := alice.ComputeShared(gotBob.PublicKey)

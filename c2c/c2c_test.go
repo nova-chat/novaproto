@@ -26,12 +26,6 @@ func TestRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCodec: %v", err)
 	}
-	if c.GetMagic() != novaproto.Magic {
-		t.Errorf("magic: got %#x, want %#x", c.GetMagic(), novaproto.Magic)
-	}
-	if c.GetVersion() != novaproto.Version {
-		t.Errorf("version: got %d, want %d", c.GetVersion(), novaproto.Version)
-	}
 
 	pkt := &NovaPacket{
 		Header:  Header{FragmentNum: 2, FragmentsCount: 5},

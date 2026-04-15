@@ -1,7 +1,8 @@
 // Package compress provides a content-aware compression helper for the
 // novaproto payload layer. It attempts compression only when it's likely
-// to save bytes, and returns an algorithm tag that the receiver stores in
-// packet metadata (e.g. c2c.Metadata) to drive Decompress.
+// to save bytes, and returns an algorithm tag that the caller carries
+// alongside the payload (e.g. as an extra field in their own packet
+// metadata) and feeds back into Decompress on the receiving side.
 //
 // Strategy:
 //
@@ -13,8 +14,8 @@
 //  3. Otherwise try zstd. If the compressed output is not at least
 //     (1 - MinSavingsRatio) smaller than the input, return the original.
 //
-// The caller stores the returned algo in metadata and passes it to
-// Decompress on the receiving side.
+// The caller carries the returned algo alongside the payload and passes
+// it to Decompress on the receiving side.
 package compress
 
 import (
