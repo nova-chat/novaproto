@@ -14,9 +14,10 @@ import (
 	"github.com/nova-chat/novaproto/serializer"
 )
 
-// Header is an alias for the shared framing header defined in internal/frame.
-// It carries fragmentation info (FragmentNum / FragmentsCount) — see
-// frame.Header for full semantics.
+// Header is an alias for the unified framing header defined in
+// internal/frame. It carries fragmentation info (FragmentNum /
+// FragmentsCount / TotalSize) plus frame-level envelope fields that
+// the codec fills in automatically on Encode.
 type Header = frame.Header
 
 // NovaPacket is the user-facing end-to-end packet.
@@ -49,24 +50,17 @@ func (c *Codec) Encode(pkt *NovaPacket) ([]byte, error) {
 	if pkt == nil {
 		return nil, errors.New("c2c: nil packet")
 	}
-	headerBytes, err := pkt.Header.Marshal()
-	if err != nil {
-		return nil, err
-	}
 	metaBytes, err := serializer.Marshal(&pkt.Meta)
 	if err != nil {
 		return nil, err
 	}
-	return c.frame.Seal(append(headerBytes, metaBytes...), pkt.Payload)
+	h := pkt.Header
+	return c.frame.Seal(&h, metaBytes, pkt.Payload)
 }
 
 // Decode parses and decrypts a wire frame into a NovaPacket.
 func (c *Codec) Decode(frameBytes []byte) (*NovaPacket, error) {
-	innerBytes, payload, err := c.frame.Open(frameBytes)
-	if err != nil {
-		return nil, err
-	}
-	header, metaBytes, err := frame.UnmarshalHeader(innerBytes)
+	header, metaBytes, payload, err := c.frame.Open(frameBytes)
 	if err != nil {
 		return nil, err
 	}

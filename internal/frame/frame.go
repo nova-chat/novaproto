@@ -17,17 +17,6 @@ import (
 	"github.com/nova-chat/novaproto"
 )
 
-const (
-	nonceSize      = 12
-	wireHeaderSize = 24
-	obfsSize       = wireHeaderSize - nonceSize // 12 bytes XOR-obfuscated
-
-	offNonce   = 0
-	offMagic   = 12
-	offVersion = 16
-	offLength  = 20
-)
-
 // Codec is the shared frame primitive. Seal encrypts (meta || payload) into
 // a wire frame; Open reverses it. Both meta and payload are opaque byte
 // blobs — callers serialize their own metadata layouts.
@@ -72,8 +61,14 @@ func NewCodec(key []byte, opts *novaproto.Options) (*Codec, error) {
 	return c, nil
 }
 
-// Seal encrypts (meta || payload) into a wire frame.
-func (c *Codec) Seal(meta, payload []byte) ([]byte, error) {
+// Seal encrypts (meta || payload) into a wire frame. The caller-supplied
+// header provides framing metadata (FragmentNum, FragmentsCount,
+// TotalSize); Seal overwrites Nonce, Magic, Version and Length with
+// frame-level values before marshalling.
+func (c *Codec) Seal(header *Header, meta, payload []byte) ([]byte, error) {
+	if header == nil {
+		return nil, errors.New("frame: nil header")
+	}
 	if len(meta) > 0xFFFF {
 		return nil, errors.New("frame: meta too large")
 	}
@@ -82,21 +77,25 @@ func (c *Codec) Seal(meta, payload []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	var nonce [nonceSize]byte
-	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
+	header.Magic = novaproto.Magic
+	header.Version = novaproto.Version
+	header.Length = uint32(len(inner) + c.aead.Overhead())
+	if _, err := io.ReadFull(rand.Reader, header.Nonce[:]); err != nil {
 		return nil, err
 	}
-	length := uint32(len(inner) + c.aead.Overhead())
 
-	headerBuf := marshalHeader(nonce[:], length)
-	ct := c.aead.Seal(nil, nonce[:], inner, headerBuf[offMagic:])
+	headerBuf, err := header.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	ct := c.aead.Seal(nil, header.Nonce[:], inner, headerBuf[nonceSize:])
 
-	ks := headerKeystream(c.obfsKey, nonce[:])
+	ks := headerKeystream(c.obfsKey, header.Nonce[:])
 	for i := 0; i < obfsSize; i++ {
-		headerBuf[offMagic+i] ^= ks[i]
+		headerBuf[nonceSize+i] ^= ks[i]
 	}
 
-	out := make([]byte, 1+c.prefixLen+wireHeaderSize+len(ct))
+	out := make([]byte, 1+c.prefixLen+HeaderSize+len(ct))
 	out[0] = byte(novaproto.FlagEncrypted)
 	if c.prefixLen > 0 {
 		if _, err := io.ReadFull(rand.Reader, out[1:1+c.prefixLen]); err != nil {
@@ -104,56 +103,51 @@ func (c *Codec) Seal(meta, payload []byte) ([]byte, error) {
 		}
 	}
 	copy(out[1+c.prefixLen:], headerBuf)
-	copy(out[1+c.prefixLen+wireHeaderSize:], ct)
+	copy(out[1+c.prefixLen+HeaderSize:], ct)
 	return out, nil
 }
 
-// Open reverses Seal and returns (meta, payload).
-func (c *Codec) Open(frame []byte) ([]byte, []byte, error) {
-	if len(frame) < 1+c.prefixLen+wireHeaderSize+c.aead.Overhead() {
-		return nil, nil, errors.New("frame: too short")
+// Open reverses Seal and returns (header, meta, payload).
+func (c *Codec) Open(frame []byte) (*Header, []byte, []byte, error) {
+	if len(frame) < 1+c.prefixLen+HeaderSize+c.aead.Overhead() {
+		return nil, nil, nil, errors.New("frame: too short")
 	}
 	if novaproto.Flag(frame[0]) != novaproto.FlagEncrypted {
-		return nil, nil, errors.New("frame: not an encrypted frame")
+		return nil, nil, nil, errors.New("frame: not an encrypted frame")
 	}
 	body := frame[1+c.prefixLen:]
 
-	headerBuf := make([]byte, wireHeaderSize)
-	copy(headerBuf, body[:wireHeaderSize])
+	headerBuf := make([]byte, HeaderSize)
+	copy(headerBuf, body[:HeaderSize])
 
-	ks := headerKeystream(c.obfsKey, headerBuf[offNonce:offNonce+nonceSize])
+	ks := headerKeystream(c.obfsKey, headerBuf[:nonceSize])
 	for i := 0; i < obfsSize; i++ {
-		headerBuf[offMagic+i] ^= ks[i]
+		headerBuf[nonceSize+i] ^= ks[i]
 	}
 
-	magic := binary.BigEndian.Uint32(headerBuf[offMagic:])
-	if magic != novaproto.Magic {
-		return nil, nil, errors.New("frame: bad magic")
-	}
-	version := binary.BigEndian.Uint32(headerBuf[offVersion:])
-	if version != novaproto.Version {
-		return nil, nil, errors.New("frame: unsupported version")
-	}
-	length := binary.BigEndian.Uint32(headerBuf[offLength:])
-	if int(length) != len(body)-wireHeaderSize {
-		return nil, nil, errors.New("frame: length mismatch")
-	}
-
-	nonce := headerBuf[offNonce : offNonce+nonceSize]
-	pt, err := c.aead.Open(nil, nonce, body[wireHeaderSize:], headerBuf[offMagic:])
+	header, err := UnmarshalHeader(headerBuf)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return parseInner(pt)
-}
+	if header.Magic != novaproto.Magic {
+		return nil, nil, nil, errors.New("frame: bad magic")
+	}
+	if header.Version != novaproto.Version {
+		return nil, nil, nil, errors.New("frame: unsupported version")
+	}
+	if int(header.Length) != len(body)-HeaderSize {
+		return nil, nil, nil, errors.New("frame: length mismatch")
+	}
 
-func marshalHeader(nonce []byte, length uint32) []byte {
-	buf := make([]byte, wireHeaderSize)
-	copy(buf[offNonce:offNonce+nonceSize], nonce)
-	binary.BigEndian.PutUint32(buf[offMagic:], novaproto.Magic)
-	binary.BigEndian.PutUint32(buf[offVersion:], novaproto.Version)
-	binary.BigEndian.PutUint32(buf[offLength:], length)
-	return buf
+	pt, err := c.aead.Open(nil, header.Nonce[:], body[HeaderSize:], headerBuf[nonceSize:])
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	meta, payload, err := parseInner(pt)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return header, meta, payload, nil
 }
 
 // Inner plaintext layout:

@@ -70,13 +70,15 @@ func TestPlainRoundtrip(t *testing.T) {
 		t.Fatalf("EncodePlain: %v", err)
 	}
 
-	// Plain frames must carry FlagPlain at offset 0 and the shared
-	// novaproto.Magic right after, so IsPlain-based dispatch works
-	// without any Codec.
+	// Plain frames must carry FlagPlain at offset 0 so IsPlain-based
+	// dispatch works without any Codec. The unified Header follows the
+	// flag byte; its Nonce occupies the next 12 bytes (zeroed in plain
+	// mode), so the shared novaproto.Magic sits at offset 1+12.
 	if novaproto.Flag(frame[0]) != novaproto.FlagPlain {
 		t.Errorf("wire flag: got %#x, want %#x", frame[0], byte(novaproto.FlagPlain))
 	}
-	if magic := binary.BigEndian.Uint32(frame[1:5]); magic != novaproto.Magic {
+	const magicOff = 1 + 12
+	if magic := binary.BigEndian.Uint32(frame[magicOff : magicOff+4]); magic != novaproto.Magic {
 		t.Errorf("wire magic: got %#x, want %#x", magic, novaproto.Magic)
 	}
 	if !IsPlain(frame) {

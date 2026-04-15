@@ -40,8 +40,10 @@ func TestRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
-	if got.Header != pkt.Header {
-		t.Errorf("Header: got %+v, want %+v", got.Header, pkt.Header)
+	if got.Header.FragmentNum != pkt.Header.FragmentNum ||
+		got.Header.FragmentsCount != pkt.Header.FragmentsCount ||
+		got.Header.TotalSize != pkt.Header.TotalSize {
+		t.Errorf("Header fragmentation: got %+v, want %+v", got.Header, pkt.Header)
 	}
 	if got.Meta != pkt.Meta {
 		t.Errorf("Meta: got %+v, want %+v", got.Meta, pkt.Meta)
