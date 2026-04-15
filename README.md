@@ -55,7 +55,8 @@ if err != nil {
 }
 
 frame, err := codec.Encode(&c2c.NovaPacket{
-    Meta:    c2c.Metadata{ContentType: 1, Encrypted: false},
+    Header:  c2c.Header{FragmentNum: 0, FragmentsCount: 1},
+    Meta:    c2c.Metadata{ContentType: 1},
     Payload: []byte("hello"),
 })
 ```
@@ -75,11 +76,11 @@ if err != nil {
 }
 
 frame, err := codec.Encode(&c2s.NovaServerPacket{
+    Header: c2s.Header{FragmentNum: 0, FragmentsCount: 1},
     Meta: c2s.Metadata{
         SenderID:    senderUUID,
         TargetID:    targetUUID,
-        MessageType: c2s.MsgData,
-        Encrypted:   true,
+        MessageType: 2, // application-defined
     },
     Payload: innerC2CFrame,
 })

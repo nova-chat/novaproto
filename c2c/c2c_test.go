@@ -34,11 +34,8 @@ func TestRoundtrip(t *testing.T) {
 	}
 
 	pkt := &NovaPacket{
-		Meta: Metadata{
-			ContentType:    7,
-			FragmentNum:    2,
-			FragmentsCount: 5,
-		},
+		Header:  Header{FragmentNum: 2, FragmentsCount: 5},
+		Meta:    Metadata{ContentType: 7},
 		Payload: []byte("hello, c2c"),
 	}
 	frame, err := c.Encode(pkt)
@@ -48,6 +45,9 @@ func TestRoundtrip(t *testing.T) {
 	got, err := c.Decode(frame)
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
+	}
+	if got.Header != pkt.Header {
+		t.Errorf("Header: got %+v, want %+v", got.Header, pkt.Header)
 	}
 	if got.Meta != pkt.Meta {
 		t.Errorf("Meta: got %+v, want %+v", got.Meta, pkt.Meta)

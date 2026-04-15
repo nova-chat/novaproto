@@ -7,38 +7,41 @@
 package c2c
 
 import (
-	"encoding/binary"
 	"errors"
 
 	"github.com/nova-chat/novaproto"
 	"github.com/nova-chat/novaproto/internal/frame"
+	"github.com/nova-chat/novaproto/serializer"
 )
 
 // NovaPacket is the user-facing end-to-end packet.
 type NovaPacket struct {
+	Header  Header
 	Meta    Metadata
 	Payload []byte
 }
 
-// Metadata carries content metadata visible only to the peer client.
-//
-// Encrypted is an application-level flag telling the peer whether the
-// Payload bytes carry another encrypted layer (e.g. re-wrapped blob,
-// application-level sealed envelope) or are plaintext content. It is
-// independent of the frame-level encryption already applied by Codec.Encode.
+// Header carries c2c-level framing fields that live outside of Metadata.
 //
 // FragmentNum / FragmentsCount let the sender split one logical message
 // across multiple c2c frames so the receiver can reassemble them. For
 // unfragmented messages set FragmentsCount = 1 and FragmentNum = 0.
-type Metadata struct {
-	ContentType    uint32
-	Encrypted      bool
+type Header struct {
 	FragmentNum    int16
 	FragmentsCount int16
 }
 
-// Wire layout: [contentType u32 | encrypted u8 | fragmentNum i16 | fragmentsCount i16]
-const metaSize = 4 + 1 + 2 + 2
+// Metadata carries content metadata visible only to the peer client.
+type Metadata struct {
+	ContentType uint32
+}
+
+// inner is the wire-format struct carried inside the encrypted region.
+// Header and Metadata are serialized together via the serializer package.
+type inner struct {
+	Header Header
+	Meta   Metadata
+}
 
 // Codec encrypts and decrypts NovaPackets with the end-to-end key.
 type Codec struct {
@@ -61,39 +64,26 @@ func (c *Codec) Encode(pkt *NovaPacket) ([]byte, error) {
 	if pkt == nil {
 		return nil, errors.New("c2c: nil packet")
 	}
-	var metaBuf [metaSize]byte
-	marshalMeta(&pkt.Meta, metaBuf[:])
-	return c.frame.Seal(metaBuf[:], pkt.Payload)
+	metaBytes, err := serializer.Marshal(&inner{Header: pkt.Header, Meta: pkt.Meta})
+	if err != nil {
+		return nil, err
+	}
+	return c.frame.Seal(metaBytes, pkt.Payload)
 }
 
 // Decode parses and decrypts a wire frame into a NovaPacket.
 func (c *Codec) Decode(frameBytes []byte) (*NovaPacket, error) {
-	meta, payload, err := c.frame.Open(frameBytes)
+	metaBytes, payload, err := c.frame.Open(frameBytes)
 	if err != nil {
 		return nil, err
 	}
-	if len(meta) != metaSize {
-		return nil, errors.New("c2c: meta size mismatch")
+	var in inner
+	if err := serializer.Unmarshal(metaBytes, &in); err != nil {
+		return nil, err
 	}
-	var m Metadata
-	unmarshalMeta(meta, &m)
-	return &NovaPacket{Meta: m, Payload: payload}, nil
-}
-
-func marshalMeta(m *Metadata, buf []byte) {
-	binary.BigEndian.PutUint32(buf[0:], m.ContentType)
-	if m.Encrypted {
-		buf[4] = 1
-	} else {
-		buf[4] = 0
-	}
-	binary.BigEndian.PutUint16(buf[5:], uint16(m.FragmentNum))
-	binary.BigEndian.PutUint16(buf[7:], uint16(m.FragmentsCount))
-}
-
-func unmarshalMeta(buf []byte, m *Metadata) {
-	m.ContentType = binary.BigEndian.Uint32(buf[0:])
-	m.Encrypted = buf[4] != 0
-	m.FragmentNum = int16(binary.BigEndian.Uint16(buf[5:]))
-	m.FragmentsCount = int16(binary.BigEndian.Uint16(buf[7:]))
+	return &NovaPacket{
+		Header:  in.Header,
+		Meta:    in.Meta,
+		Payload: payload,
+	}, nil
 }

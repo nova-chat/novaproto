@@ -20,37 +20,45 @@ import (
 
 	"github.com/nova-chat/novaproto"
 	"github.com/nova-chat/novaproto/internal/frame"
+	"github.com/nova-chat/novaproto/serializer"
 )
 
 // NovaServerPacket is the client↔server packet.
 type NovaServerPacket struct {
+	Header  Header
 	Meta    Metadata
 	Payload []byte
 }
 
-// Metadata is the c2s-layer metadata. Fixed binary layout, 45 bytes:
+// Header carries c2s-level framing fields that live outside of Metadata.
 //
-//	sender(16) || target(16) || msgType(4) || timestamp(8) || encrypted(1)
-//
-// Encrypted is an application-level flag telling the receiver whether the
-// Payload bytes carry another encrypted layer (typically a c2c frame) or
-// plaintext server control data. It is independent of the frame-level
-// encryption already applied by Codec.Encode / checked via IsPlain.
+// FragmentNum / FragmentsCount let the sender split one logical transport
+// message across multiple c2s frames so the receiver can reassemble them.
+// For unfragmented messages set FragmentsCount = 1 and FragmentNum = 0.
+type Header struct {
+	FragmentNum    int16
+	FragmentsCount int16
+}
+
+// Metadata is the c2s-layer routing metadata.
 type Metadata struct {
 	SenderID    uuid.UUID
 	TargetID    uuid.UUID
 	MessageType uint32
 	Timestamp   int64
-	Encrypted   bool
 }
 
-type MessageType uint32
-
-const metaSize = 16 + 16 + 4 + 8 + 1 // 45
+// inner is the wire-format struct carried inside the encrypted (and plain)
+// region. Header and Metadata are serialized together via the serializer
+// package.
+type inner struct {
+	Header Header
+	Meta   Metadata
+}
 
 // Plain wire layout:
 //
-//	[flag 1 | magic 4 | version 4 | metaLen 4 | payLen 4 | meta(metaLen) | payload(payLen)]
+//	[flag 1 | magic 4 | version 4 | innerLen 4 | payLen 4 | inner(innerLen) | payload(payLen)]
 const plainHeaderLen = 1 + 4 + 4 + 4 + 4 // 17
 
 // Codec encrypts and decrypts NovaServerPackets with the transport key.
@@ -77,23 +85,28 @@ func (c *Codec) Encode(pkt *NovaServerPacket) ([]byte, error) {
 	if pkt.Meta.Timestamp == 0 {
 		pkt.Meta.Timestamp = time.Now().UnixNano()
 	}
-	var metaBuf [metaSize]byte
-	marshalMeta(&pkt.Meta, metaBuf[:])
-	return c.frame.Seal(metaBuf[:], pkt.Payload)
+	innerBytes, err := serializer.Marshal(&inner{Header: pkt.Header, Meta: pkt.Meta})
+	if err != nil {
+		return nil, err
+	}
+	return c.frame.Seal(innerBytes, pkt.Payload)
 }
 
 // Decode parses and decrypts a wire frame into a NovaServerPacket.
 func (c *Codec) Decode(frameBytes []byte) (*NovaServerPacket, error) {
-	meta, payload, err := c.frame.Open(frameBytes)
+	innerBytes, payload, err := c.frame.Open(frameBytes)
 	if err != nil {
 		return nil, err
 	}
-	if len(meta) != metaSize {
-		return nil, errors.New("c2s: meta size mismatch")
+	var in inner
+	if err := serializer.Unmarshal(innerBytes, &in); err != nil {
+		return nil, err
 	}
-	var m Metadata
-	unmarshalMeta(meta, &m)
-	return &NovaServerPacket{Meta: m, Payload: payload}, nil
+	return &NovaServerPacket{
+		Header:  in.Header,
+		Meta:    in.Meta,
+		Payload: payload,
+	}, nil
 }
 
 // IsPlain reports whether a frame is a plaintext c2s frame, based on the
@@ -120,17 +133,19 @@ func EncodePlain(pkt *NovaServerPacket) ([]byte, error) {
 		pkt.Meta.Timestamp = time.Now().UnixNano()
 	}
 
-	var metaBuf [metaSize]byte
-	marshalMeta(&pkt.Meta, metaBuf[:])
+	innerBytes, err := serializer.Marshal(&inner{Header: pkt.Header, Meta: pkt.Meta})
+	if err != nil {
+		return nil, err
+	}
 
-	out := make([]byte, plainHeaderLen+metaSize+len(pkt.Payload))
+	out := make([]byte, plainHeaderLen+len(innerBytes)+len(pkt.Payload))
 	out[0] = byte(novaproto.FlagPlain)
 	binary.BigEndian.PutUint32(out[1:], novaproto.Magic)
 	binary.BigEndian.PutUint32(out[5:], novaproto.Version)
-	binary.BigEndian.PutUint32(out[9:], uint32(metaSize))
+	binary.BigEndian.PutUint32(out[9:], uint32(len(innerBytes)))
 	binary.BigEndian.PutUint32(out[13:], uint32(len(pkt.Payload)))
-	copy(out[plainHeaderLen:], metaBuf[:])
-	copy(out[plainHeaderLen+metaSize:], pkt.Payload)
+	copy(out[plainHeaderLen:], innerBytes)
+	copy(out[plainHeaderLen+len(innerBytes):], pkt.Payload)
 	return out, nil
 }
 
@@ -150,47 +165,20 @@ func DecodePlain(frameBytes []byte) (*NovaServerPacket, error) {
 	if version != novaproto.Version {
 		return nil, errors.New("c2s: unsupported plain version")
 	}
-	metaLen := binary.BigEndian.Uint32(frameBytes[9:])
+	innerLen := binary.BigEndian.Uint32(frameBytes[9:])
 	payLen := binary.BigEndian.Uint32(frameBytes[13:])
-	if metaLen != metaSize {
-		return nil, errors.New("c2s: plain meta size mismatch")
-	}
-	if int(plainHeaderLen+metaLen+payLen) != len(frameBytes) {
+	if int(plainHeaderLen)+int(innerLen)+int(payLen) != len(frameBytes) {
 		return nil, errors.New("c2s: plain length mismatch")
 	}
 
-	var m Metadata
-	unmarshalMeta(frameBytes[plainHeaderLen:plainHeaderLen+metaLen], &m)
-	payload := append([]byte(nil), frameBytes[plainHeaderLen+metaLen:]...)
-	return &NovaServerPacket{Meta: m, Payload: payload}, nil
-}
-
-func marshalMeta(m *Metadata, buf []byte) {
-	off := 0
-	copy(buf[off:off+16], m.SenderID[:])
-	off += 16
-	copy(buf[off:off+16], m.TargetID[:])
-	off += 16
-	binary.BigEndian.PutUint32(buf[off:], uint32(m.MessageType))
-	off += 4
-	binary.BigEndian.PutUint64(buf[off:], uint64(m.Timestamp))
-	off += 8
-	if m.Encrypted {
-		buf[off] = 1
-	} else {
-		buf[off] = 0
+	var in inner
+	if err := serializer.Unmarshal(frameBytes[plainHeaderLen:plainHeaderLen+int(innerLen)], &in); err != nil {
+		return nil, err
 	}
-}
-
-func unmarshalMeta(buf []byte, m *Metadata) {
-	off := 0
-	copy(m.SenderID[:], buf[off:off+16])
-	off += 16
-	copy(m.TargetID[:], buf[off:off+16])
-	off += 16
-	m.MessageType = binary.BigEndian.Uint32(buf[off:])
-	off += 4
-	m.Timestamp = int64(binary.BigEndian.Uint64(buf[off:]))
-	off += 8
-	m.Encrypted = buf[off] != 0
+	payload := append([]byte(nil), frameBytes[plainHeaderLen+int(innerLen):]...)
+	return &NovaServerPacket{
+		Header:  in.Header,
+		Meta:    in.Meta,
+		Payload: payload,
+	}, nil
 }
