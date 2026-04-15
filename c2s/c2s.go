@@ -12,7 +12,6 @@
 package c2s
 
 import (
-	"encoding/binary"
 	"errors"
 	"time"
 
@@ -26,7 +25,8 @@ import (
 // Header is an alias for the unified framing header defined in the
 // top-level novaproto package. It carries fragmentation info
 // (FragmentNum / FragmentsCount / TotalSize) plus frame-level envelope
-// fields that the codec fills in automatically on Encode.
+// fields (IsEncrypted, Nonce, Magic, Version, Length) that the codec
+// fills in automatically on Encode/EncodePlain.
 type Header = novaproto.Header
 
 // NovaServerPacket is the client↔server packet.
@@ -44,10 +44,15 @@ type Metadata struct {
 	Timestamp   int64
 }
 
-// Plain wire layout:
-//
-//	[flag 1 | Header(HeaderSize) | metaLen 4 | payLen 4 | meta(metaLen) | payload(payLen)]
-const plainPrefixLen = 1 + novaproto.HeaderSize + 4 + 4
+// plainFrame is the wire-level struct for unencrypted c2s frames.
+// Marshalled by the serializer package: 33-byte Header, followed by
+// serializer's standard u32-length-prefixed byte slices for Meta and
+// Payload.
+type plainFrame struct {
+	Header  novaproto.Header
+	Meta    []byte
+	Payload []byte
+}
 
 // Codec encrypts and decrypts NovaServerPackets with the transport key.
 type Codec struct {
@@ -96,8 +101,9 @@ func (c *Codec) Decode(frameBytes []byte) (*NovaServerPacket, error) {
 }
 
 // IsPlain reports whether a frame is a plaintext c2s frame, based on the
-// one-byte flag at offset 0. Works without a Codec instance, so it can be
-// used during handshake before a transport key has been negotiated:
+// Header.IsEncrypted field at offset 0. Works without a Codec instance,
+// so it can be used during handshake before a transport key has been
+// negotiated:
 //
 //	if c2s.IsPlain(frame) {
 //	    pkt, err := c2s.DecodePlain(frame)
@@ -105,7 +111,7 @@ func (c *Codec) Decode(frameBytes []byte) (*NovaServerPacket, error) {
 //	    pkt, err := codec.Decode(frame)
 //	}
 func IsPlain(frameBytes []byte) bool {
-	return len(frameBytes) >= 1 && novaproto.Flag(frameBytes[0]) == novaproto.FlagPlain
+	return len(frameBytes) >= 1 && frameBytes[0] == 0
 }
 
 // EncodePlain serializes a NovaServerPacket without encryption. Intended for
@@ -125,60 +131,41 @@ func EncodePlain(pkt *NovaServerPacket) ([]byte, error) {
 	}
 
 	h := pkt.Header
+	h.IsEncrypted = false
 	h.Magic = novaproto.Magic
 	h.Version = novaproto.Version
 	h.Length = uint32(len(metaBytes) + len(pkt.Payload))
-	h.Nonce = [12]byte{}
-	headerBuf, err := h.Marshal()
-	if err != nil {
-		return nil, err
-	}
+	h.Nonce = [novaproto.NonceSize]byte{}
 
-	out := make([]byte, plainPrefixLen+len(metaBytes)+len(pkt.Payload))
-	out[0] = byte(novaproto.FlagPlain)
-	copy(out[1:], headerBuf)
-	binary.BigEndian.PutUint32(out[1+novaproto.HeaderSize:], uint32(len(metaBytes)))
-	binary.BigEndian.PutUint32(out[1+novaproto.HeaderSize+4:], uint32(len(pkt.Payload)))
-	copy(out[plainPrefixLen:], metaBytes)
-	copy(out[plainPrefixLen+len(metaBytes):], pkt.Payload)
-	return out, nil
+	return serializer.Marshal(&plainFrame{
+		Header:  h,
+		Meta:    metaBytes,
+		Payload: pkt.Payload,
+	})
 }
 
 // DecodePlain reverses EncodePlain.
 func DecodePlain(frameBytes []byte) (*NovaServerPacket, error) {
-	if len(frameBytes) < plainPrefixLen {
-		return nil, errors.New("c2s: plain frame too short")
+	var pf plainFrame
+	if err := serializer.Unmarshal(frameBytes, &pf); err != nil {
+		return nil, err
 	}
-	if novaproto.Flag(frameBytes[0]) != novaproto.FlagPlain {
+	if pf.Header.IsEncrypted {
 		return nil, errors.New("c2s: not a plain frame")
 	}
-
-	header, err := novaproto.UnmarshalHeader(frameBytes[1 : 1+novaproto.HeaderSize])
-	if err != nil {
-		return nil, err
-	}
-	if header.Magic != novaproto.Magic {
+	if pf.Header.Magic != novaproto.Magic {
 		return nil, errors.New("c2s: bad magic")
 	}
-	if header.Version != novaproto.Version {
+	if pf.Header.Version != novaproto.Version {
 		return nil, errors.New("c2s: unsupported plain version")
 	}
-
-	metaLen := binary.BigEndian.Uint32(frameBytes[1+novaproto.HeaderSize:])
-	payLen := binary.BigEndian.Uint32(frameBytes[1+novaproto.HeaderSize+4:])
-	if int(plainPrefixLen)+int(metaLen)+int(payLen) != len(frameBytes) {
-		return nil, errors.New("c2s: plain length mismatch")
-	}
-
-	metaBytes := frameBytes[plainPrefixLen : plainPrefixLen+int(metaLen)]
 	var meta Metadata
-	if err := serializer.Unmarshal(metaBytes, &meta); err != nil {
+	if err := serializer.Unmarshal(pf.Meta, &meta); err != nil {
 		return nil, err
 	}
-	payload := append([]byte(nil), frameBytes[plainPrefixLen+int(metaLen):]...)
 	return &NovaServerPacket{
-		Header:  *header,
+		Header:  pf.Header,
 		Meta:    meta,
-		Payload: payload,
+		Payload: pf.Payload,
 	}, nil
 }

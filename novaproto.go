@@ -23,15 +23,6 @@ const (
 	Version uint32 = 1
 )
 
-// Flag is the first byte of every wire frame. It tells the receiver how to
-// interpret the rest of the frame without needing a Codec or the key.
-type Flag uint8
-
-const (
-	FlagEncrypted Flag = 0x00
-	FlagPlain     Flag = 0x01
-)
-
 // Options tunes padding and random-prefix behavior for DPI resistance.
 // Same shape for every codec layer; each layer gets its own instance.
 type Options struct {
@@ -54,18 +45,22 @@ const MaxPrefixLen = 64
 const NonceSize = 12
 
 // HeaderSize is the fixed serialized size of a Header on the wire.
-const HeaderSize = NonceSize + 4 + 4 + 4 + 2 + 2 + 4 // 32
+const HeaderSize = 1 + NonceSize + 4 + 4 + 4 + 2 + 2 + 4 // 33
 
-// Header is the outer 32-byte frame header.
+// Header is the outer 33-byte frame header.
 //
 // Some fields are filled in by the frame primitive itself during sealing
-// (Nonce, Magic, Version, Length); the rest are caller-provided framing
-// metadata (FragmentNum, FragmentsCount, TotalSize).
+// (IsEncrypted, Nonce, Magic, Version, Length); the rest are
+// caller-provided framing metadata (FragmentNum, FragmentsCount,
+// TotalSize).
 //
-// Wire position: first HeaderSize bytes after the flag byte and the
-// optional random prefix. The nonce travels in the clear; every byte
-// after it is XOR-obfuscated with a per-session keystream and
-// authenticated as AEAD additional data.
+// Wire position: Header occupies the first HeaderSize bytes of the wire
+// frame. IsEncrypted (one byte) and Nonce travel in the clear — this
+// lets a receiver dispatch plain vs. encrypted frames without a key by
+// reading byte 0. In encrypted frames every byte after the nonce is
+// XOR-obfuscated with a per-session keystream and authenticated as AEAD
+// additional data; in plain frames the whole Header is on the wire in
+// the clear.
 //
 // FragmentNum / FragmentsCount let the sender split one logical message
 // across multiple frames. For unfragmented messages set FragmentsCount = 1
@@ -73,6 +68,7 @@ const HeaderSize = NonceSize + 4 + 4 + 4 + 2 + 2 + 4 // 32
 // reassembled logical payload; the receiver uses it to pre-allocate a
 // buffer and sanity-check completeness.
 type Header struct {
+	IsEncrypted    bool
 	Nonce          [NonceSize]byte
 	Magic          uint32
 	Version        uint32

@@ -20,9 +20,12 @@ import (
 const (
 	// nonceSize is the AES-GCM nonce length and matches novaproto.NonceSize.
 	nonceSize = novaproto.NonceSize
-	// obfsSize is the number of bytes after the nonce in a Header that
-	// are XOR-obfuscated and authenticated as AEAD AAD.
-	obfsSize = novaproto.HeaderSize - nonceSize
+	// obfsOffset marks where the obfuscated region starts within a Header:
+	// after the 1-byte IsEncrypted flag and the 12-byte Nonce.
+	obfsOffset = 1 + nonceSize
+	// obfsSize is the number of Header bytes that are XOR-obfuscated and
+	// authenticated as AEAD AAD.
+	obfsSize = novaproto.HeaderSize - obfsOffset
 )
 
 // Codec is the shared frame primitive. Seal encrypts (meta || payload) into
@@ -71,8 +74,10 @@ func NewCodec(key []byte, opts *novaproto.Options) (*Codec, error) {
 
 // Seal encrypts (meta || payload) into a wire frame. The caller-supplied
 // header provides framing metadata (FragmentNum, FragmentsCount,
-// TotalSize); Seal overwrites Nonce, Magic, Version and Length with
-// frame-level values before marshalling.
+// TotalSize); Seal overwrites IsEncrypted, Nonce, Magic, Version and
+// Length with frame-level values before marshalling.
+//
+// Wire layout: [header HeaderSize | prefix prefixLen | ciphertext].
 func (c *Codec) Seal(header *novaproto.Header, meta, payload []byte) ([]byte, error) {
 	if header == nil {
 		return nil, errors.New("frame: nil header")
@@ -85,6 +90,7 @@ func (c *Codec) Seal(header *novaproto.Header, meta, payload []byte) ([]byte, er
 		return nil, err
 	}
 
+	header.IsEncrypted = true
 	header.Magic = novaproto.Magic
 	header.Version = novaproto.Version
 	header.Length = uint32(len(inner) + c.aead.Overhead())
@@ -96,46 +102,44 @@ func (c *Codec) Seal(header *novaproto.Header, meta, payload []byte) ([]byte, er
 	if err != nil {
 		return nil, err
 	}
-	ct := c.aead.Seal(nil, header.Nonce[:], inner, headerBuf[nonceSize:])
+	ct := c.aead.Seal(nil, header.Nonce[:], inner, headerBuf[obfsOffset:])
 
 	ks := headerKeystream(c.obfsKey, header.Nonce[:])
 	for i := 0; i < obfsSize; i++ {
-		headerBuf[nonceSize+i] ^= ks[i]
+		headerBuf[obfsOffset+i] ^= ks[i]
 	}
 
-	out := make([]byte, 1+c.prefixLen+novaproto.HeaderSize+len(ct))
-	out[0] = byte(novaproto.FlagEncrypted)
+	out := make([]byte, novaproto.HeaderSize+c.prefixLen+len(ct))
+	copy(out[:novaproto.HeaderSize], headerBuf)
 	if c.prefixLen > 0 {
-		if _, err := io.ReadFull(rand.Reader, out[1:1+c.prefixLen]); err != nil {
+		if _, err := io.ReadFull(rand.Reader, out[novaproto.HeaderSize:novaproto.HeaderSize+c.prefixLen]); err != nil {
 			return nil, err
 		}
 	}
-	copy(out[1+c.prefixLen:], headerBuf)
-	copy(out[1+c.prefixLen+novaproto.HeaderSize:], ct)
+	copy(out[novaproto.HeaderSize+c.prefixLen:], ct)
 	return out, nil
 }
 
 // Open reverses Seal and returns (header, meta, payload).
 func (c *Codec) Open(frame []byte) (*novaproto.Header, []byte, []byte, error) {
-	if len(frame) < 1+c.prefixLen+novaproto.HeaderSize+c.aead.Overhead() {
+	if len(frame) < novaproto.HeaderSize+c.prefixLen+c.aead.Overhead() {
 		return nil, nil, nil, errors.New("frame: too short")
 	}
-	if novaproto.Flag(frame[0]) != novaproto.FlagEncrypted {
-		return nil, nil, nil, errors.New("frame: not an encrypted frame")
-	}
-	body := frame[1+c.prefixLen:]
 
 	headerBuf := make([]byte, novaproto.HeaderSize)
-	copy(headerBuf, body[:novaproto.HeaderSize])
+	copy(headerBuf, frame[:novaproto.HeaderSize])
 
-	ks := headerKeystream(c.obfsKey, headerBuf[:nonceSize])
+	ks := headerKeystream(c.obfsKey, headerBuf[1:1+nonceSize])
 	for i := 0; i < obfsSize; i++ {
-		headerBuf[nonceSize+i] ^= ks[i]
+		headerBuf[obfsOffset+i] ^= ks[i]
 	}
 
 	header, err := novaproto.UnmarshalHeader(headerBuf)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	if !header.IsEncrypted {
+		return nil, nil, nil, errors.New("frame: not an encrypted frame")
 	}
 	if header.Magic != novaproto.Magic {
 		return nil, nil, nil, errors.New("frame: bad magic")
@@ -143,11 +147,13 @@ func (c *Codec) Open(frame []byte) (*novaproto.Header, []byte, []byte, error) {
 	if header.Version != novaproto.Version {
 		return nil, nil, nil, errors.New("frame: unsupported version")
 	}
-	if int(header.Length) != len(body)-novaproto.HeaderSize {
+
+	ctStart := novaproto.HeaderSize + c.prefixLen
+	if int(header.Length) != len(frame)-ctStart {
 		return nil, nil, nil, errors.New("frame: length mismatch")
 	}
 
-	pt, err := c.aead.Open(nil, header.Nonce[:], body[novaproto.HeaderSize:], headerBuf[nonceSize:])
+	pt, err := c.aead.Open(nil, header.Nonce[:], frame[ctStart:], headerBuf[obfsOffset:])
 	if err != nil {
 		return nil, nil, nil, err
 	}
