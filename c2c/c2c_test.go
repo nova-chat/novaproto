@@ -34,7 +34,11 @@ func TestRoundtrip(t *testing.T) {
 	}
 
 	pkt := &NovaPacket{
-		Meta:    Metadata{ContentType: 7},
+		Meta: Metadata{
+			ContentType:    7,
+			FragmentNum:    2,
+			FragmentsCount: 5,
+		},
 		Payload: []byte("hello, c2c"),
 	}
 	frame, err := c.Encode(pkt)

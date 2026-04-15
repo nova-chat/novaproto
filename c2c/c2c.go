@@ -26,13 +26,19 @@ type NovaPacket struct {
 // Payload bytes carry another encrypted layer (e.g. re-wrapped blob,
 // application-level sealed envelope) or are plaintext content. It is
 // independent of the frame-level encryption already applied by Codec.Encode.
+//
+// FragmentNum / FragmentsCount let the sender split one logical message
+// across multiple c2c frames so the receiver can reassemble them. For
+// unfragmented messages set FragmentsCount = 1 and FragmentNum = 0.
 type Metadata struct {
-	ContentType uint32
-	Encrypted   bool
+	ContentType    uint32
+	Encrypted      bool
+	FragmentNum    int16
+	FragmentsCount int16
 }
 
-// Wire layout: [contentType u32 | encrypted u8]
-const metaSize = 4 + 1
+// Wire layout: [contentType u32 | encrypted u8 | fragmentNum i16 | fragmentsCount i16]
+const metaSize = 4 + 1 + 2 + 2
 
 // Codec encrypts and decrypts NovaPackets with the end-to-end key.
 type Codec struct {
@@ -81,9 +87,13 @@ func marshalMeta(m *Metadata, buf []byte) {
 	} else {
 		buf[4] = 0
 	}
+	binary.BigEndian.PutUint16(buf[5:], uint16(m.FragmentNum))
+	binary.BigEndian.PutUint16(buf[7:], uint16(m.FragmentsCount))
 }
 
 func unmarshalMeta(buf []byte, m *Metadata) {
 	m.ContentType = binary.BigEndian.Uint32(buf[0:])
 	m.Encrypted = buf[4] != 0
+	m.FragmentNum = int16(binary.BigEndian.Uint16(buf[5:]))
+	m.FragmentsCount = int16(binary.BigEndian.Uint16(buf[7:]))
 }
