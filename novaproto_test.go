@@ -10,9 +10,19 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/nova-chat/novaproto"
 	"github.com/nova-chat/novaproto/c2c"
 	"github.com/nova-chat/novaproto/c2s"
 )
+
+func encryptedParams(t *testing.T) novaproto.HeaderParams {
+	t.Helper()
+	p := novaproto.HeaderParams{FragmentsCount: 1, IsEncrypted: true}
+	if _, err := rand.Read(p.Nonce[:]); err != nil {
+		t.Fatalf("nonce: %v", err)
+	}
+	return p
+}
 
 func randKey(t *testing.T) []byte {
 	t.Helper()
@@ -74,7 +84,7 @@ func TestClientServerClientRelay(t *testing.T) {
 		Meta:    c2c.Metadata{ContentType: 42},
 		Payload: payload,
 	}
-	innerFrame, err := c2cClient.Encode(innerPkt)
+	innerFrame, err := c2cClient.Encode(innerPkt, encryptedParams(t))
 	if err != nil {
 		t.Fatalf("c2c Encode: %v", err)
 	}
@@ -88,14 +98,14 @@ func TestClientServerClientRelay(t *testing.T) {
 		},
 		Payload: innerFrame,
 	}
-	outerFrame, err := c2sClientA.Encode(outerPkt)
+	outerFrame, err := c2sClientA.Encode(outerPkt, encryptedParams(t))
 	if err != nil {
 		t.Fatalf("c2s Encode: %v", err)
 	}
 
 	// 3. Server receives the outer frame on link A, decodes c2s layer.
 	//    It sees the metadata but the payload stays opaque (still c2c-ciphertext).
-	received, err := c2sServerA.Decode(outerFrame)
+	received, _, err := c2sServerA.Decode(outerFrame)
 	if err != nil {
 		t.Fatalf("server Decode: %v", err)
 	}
@@ -110,13 +120,13 @@ func TestClientServerClientRelay(t *testing.T) {
 	relayFrame, err := c2sServerB.Encode(&c2s.NovaServerPacket{
 		Meta:    received.Meta,
 		Payload: received.Payload,
-	})
+	}, encryptedParams(t))
 	if err != nil {
 		t.Fatalf("server relay Encode: %v", err)
 	}
 
 	// 5. Client B decodes c2s layer, then c2c layer.
-	recvOuter, err := c2sClientB.Decode(relayFrame)
+	recvOuter, _, err := c2sClientB.Decode(relayFrame)
 	if err != nil {
 		t.Fatalf("client B c2s Decode: %v", err)
 	}
@@ -124,7 +134,7 @@ func TestClientServerClientRelay(t *testing.T) {
 		t.Errorf("client B meta mismatch: %+v", recvOuter.Meta)
 	}
 
-	recvInner, err := c2cClient.Decode(recvOuter.Payload)
+	recvInner, _, err := c2cClient.Decode(recvOuter.Payload)
 	if err != nil {
 		t.Fatalf("client B c2c Decode: %v", err)
 	}
@@ -165,7 +175,7 @@ func TestTCPRoundtrip30MB(t *testing.T) {
 		Meta:    c2c.Metadata{ContentType: 7},
 		Payload: payload,
 	}
-	frame, err := sender.Encode(pkt)
+	frame, err := sender.Encode(pkt, encryptedParams(t))
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
 	}
@@ -195,7 +205,7 @@ func TestTCPRoundtrip30MB(t *testing.T) {
 			resCh <- result{err: err}
 			return
 		}
-		p, err := receiver.Decode(data)
+		p, _, err := receiver.Decode(data)
 		resCh <- result{pkt: p, err: err}
 	}()
 

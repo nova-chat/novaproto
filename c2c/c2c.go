@@ -14,15 +14,10 @@ import (
 	"github.com/nova-chat/novaproto/serializer"
 )
 
-// Header is an alias for the unified framing header defined in the
-// top-level novaproto package. It carries fragmentation info
-// (FragmentNum / FragmentsCount / TotalSize) plus frame-level envelope
-// fields that the codec fills in automatically on Encode.
-type Header = novaproto.Header
-
-// NovaPacket is the user-facing end-to-end packet.
+// NovaPacket is the user-facing end-to-end packet. Framing metadata
+// (nonce, fragmentation, encryption flag) is passed separately as
+// novaproto.HeaderParams to Encode / returned from Decode.
 type NovaPacket struct {
-	Header  Header
 	Meta    Metadata
 	Payload []byte
 }
@@ -45,8 +40,10 @@ func NewCodec(key []byte, opts *novaproto.Options) (*Codec, error) {
 	return &Codec{frame: f}, nil
 }
 
-// Encode serializes and encrypts a NovaPacket into a wire frame.
-func (c *Codec) Encode(pkt *NovaPacket) ([]byte, error) {
+// Encode serializes a NovaPacket into a wire frame. If params.IsEncrypted
+// is true the frame is sealed with the codec's end-to-end key; otherwise
+// it is emitted in the clear (plain mode).
+func (c *Codec) Encode(pkt *NovaPacket, params novaproto.HeaderParams) ([]byte, error) {
 	if pkt == nil {
 		return nil, errors.New("c2c: nil packet")
 	}
@@ -54,23 +51,58 @@ func (c *Codec) Encode(pkt *NovaPacket) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	h := pkt.Header
-	return c.frame.Seal(&h, metaBytes, pkt.Payload)
+	h := headerFromParams(params)
+	if params.IsEncrypted {
+		return c.frame.Seal(&h, metaBytes, pkt.Payload)
+	}
+	return frame.MarshalPlain(&h, metaBytes, pkt.Payload)
 }
 
-// Decode parses and decrypts a wire frame into a NovaPacket.
-func (c *Codec) Decode(frameBytes []byte) (*NovaPacket, error) {
-	header, metaBytes, payload, err := c.frame.Open(frameBytes)
-	if err != nil {
-		return nil, err
+// Decode parses a wire frame into a NovaPacket. The returned
+// HeaderParams reflects the framing metadata that was on the wire.
+// Plain and encrypted frames are dispatched automatically based on the
+// IsEncrypted byte at offset 0.
+func (c *Codec) Decode(frameBytes []byte) (*NovaPacket, novaproto.HeaderParams, error) {
+	if len(frameBytes) < 1 {
+		return nil, novaproto.HeaderParams{}, errors.New("c2c: empty frame")
 	}
+
+	var (
+		header    *novaproto.Header
+		metaBytes []byte
+		payload   []byte
+		err       error
+	)
+	if frameBytes[0] == 0 {
+		header, metaBytes, payload, err = frame.UnmarshalPlain(frameBytes)
+	} else {
+		header, metaBytes, payload, err = c.frame.Open(frameBytes)
+	}
+	if err != nil {
+		return nil, novaproto.HeaderParams{}, err
+	}
+
 	var meta Metadata
 	if err := serializer.Unmarshal(metaBytes, &meta); err != nil {
-		return nil, err
+		return nil, novaproto.HeaderParams{}, err
 	}
-	return &NovaPacket{
-		Header:  *header,
-		Meta:    meta,
-		Payload: payload,
-	}, nil
+	return &NovaPacket{Meta: meta, Payload: payload}, paramsFromHeader(header), nil
+}
+
+func headerFromParams(p novaproto.HeaderParams) novaproto.Header {
+	return novaproto.Header{
+		IsEncrypted:    p.IsEncrypted,
+		Nonce:          p.Nonce,
+		FragmentNum:    p.FragmentNum,
+		FragmentsCount: p.FragmentsCount,
+	}
+}
+
+func paramsFromHeader(h *novaproto.Header) novaproto.HeaderParams {
+	return novaproto.HeaderParams{
+		Nonce:          h.Nonce,
+		FragmentNum:    h.FragmentNum,
+		FragmentsCount: h.FragmentsCount,
+		IsEncrypted:    h.IsEncrypted,
+	}
 }

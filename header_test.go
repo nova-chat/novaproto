@@ -13,7 +13,6 @@ func TestHeaderSizeMatchesSerialized(t *testing.T) {
 		Length:         1024,
 		FragmentNum:    3,
 		FragmentsCount: 5,
-		TotalSize:      1024,
 	}
 	buf, err := h.Marshal()
 	if err != nil {
@@ -33,7 +32,6 @@ func TestHeaderRoundtrip(t *testing.T) {
 		Length:         4096,
 		FragmentNum:    7,
 		FragmentsCount: 12,
-		TotalSize:      65536,
 	}
 	buf, err := in.Marshal()
 	if err != nil {

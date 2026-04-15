@@ -45,14 +45,28 @@ const MaxPrefixLen = 64
 const NonceSize = 12
 
 // HeaderSize is the fixed serialized size of a Header on the wire.
-const HeaderSize = 1 + NonceSize + 4 + 4 + 4 + 2 + 2 + 4 // 33
+const HeaderSize = 1 + NonceSize + 4 + 4 + 4 + 2 + 2 // 29
 
-// Header is the outer 33-byte frame header.
+// HeaderParams is the set of Header fields a caller controls on Encode
+// and receives on Decode. Magic, Version and Length are filled in by
+// the codec and are not exposed here.
+//
+// Nonce must be unique per (key, frame) for encrypted frames —
+// reusing a nonce with the same key breaks AES-GCM. Callers are
+// expected to draw it from crypto/rand for each Encode call. For plain
+// frames Nonce is a free field the caller may set to zero.
+type HeaderParams struct {
+	Nonce          [NonceSize]byte
+	FragmentNum    int16
+	FragmentsCount int16
+	IsEncrypted    bool
+}
+
+// Header is the outer 29-byte frame header.
 //
 // Some fields are filled in by the frame primitive itself during sealing
-// (IsEncrypted, Nonce, Magic, Version, Length); the rest are
-// caller-provided framing metadata (FragmentNum, FragmentsCount,
-// TotalSize).
+// (Nonce, Magic, Version, Length); the rest come from the caller via
+// HeaderParams (IsEncrypted, FragmentNum, FragmentsCount).
 //
 // Wire position: Header occupies the first HeaderSize bytes of the wire
 // frame. IsEncrypted (one byte) and Nonce travel in the clear — this
@@ -64,9 +78,7 @@ const HeaderSize = 1 + NonceSize + 4 + 4 + 4 + 2 + 2 + 4 // 33
 //
 // FragmentNum / FragmentsCount let the sender split one logical message
 // across multiple frames. For unfragmented messages set FragmentsCount = 1
-// and FragmentNum = 0. TotalSize is the size in bytes of the fully
-// reassembled logical payload; the receiver uses it to pre-allocate a
-// buffer and sanity-check completeness.
+// and FragmentNum = 0.
 type Header struct {
 	IsEncrypted    bool
 	Nonce          [NonceSize]byte
@@ -75,7 +87,6 @@ type Header struct {
 	Length         uint32
 	FragmentNum    int16
 	FragmentsCount int16
-	TotalSize      uint32
 }
 
 // Marshal serializes the Header via the serializer package.

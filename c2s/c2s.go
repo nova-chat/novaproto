@@ -5,10 +5,9 @@
 // readable by the server so it can route; Payload is opaque to the server
 // and typically holds a c2c-encoded NovaPacket.
 //
-// The package also exposes EncodePlain/DecodePlain for unencrypted frames,
-// used during the initial handshake before a transport key is established.
-// Plain frames carry no confidentiality — they are intended for key
-// exchange and version negotiation only.
+// Encode dispatches on HeaderParams.IsEncrypted: true produces a sealed
+// frame, false produces a plain handshake frame (no confidentiality,
+// used for key exchange and version negotiation only).
 package c2s
 
 import (
@@ -22,16 +21,10 @@ import (
 	"github.com/nova-chat/novaproto/serializer"
 )
 
-// Header is an alias for the unified framing header defined in the
-// top-level novaproto package. It carries fragmentation info
-// (FragmentNum / FragmentsCount / TotalSize) plus frame-level envelope
-// fields (IsEncrypted, Nonce, Magic, Version, Length) that the codec
-// fills in automatically on Encode/EncodePlain.
-type Header = novaproto.Header
-
-// NovaServerPacket is the client↔server packet.
+// NovaServerPacket is the client↔server packet. Framing metadata
+// (nonce, fragmentation, encryption flag) is passed separately as
+// novaproto.HeaderParams to Encode / returned from Decode.
 type NovaServerPacket struct {
-	Header  Header
 	Meta    Metadata
 	Payload []byte
 }
@@ -42,16 +35,6 @@ type Metadata struct {
 	TargetID    uuid.UUID
 	MessageType uint32
 	Timestamp   int64
-}
-
-// plainFrame is the wire-level struct for unencrypted c2s frames.
-// Marshalled by the serializer package: 33-byte Header, followed by
-// serializer's standard u32-length-prefixed byte slices for Meta and
-// Payload.
-type plainFrame struct {
-	Header  novaproto.Header
-	Meta    []byte
-	Payload []byte
 }
 
 // Codec encrypts and decrypts NovaServerPackets with the transport key.
@@ -67,8 +50,11 @@ func NewCodec(key []byte, opts *novaproto.Options) (*Codec, error) {
 	return &Codec{frame: f}, nil
 }
 
-// Encode serializes and encrypts a NovaServerPacket into a wire frame.
-func (c *Codec) Encode(pkt *NovaServerPacket) ([]byte, error) {
+// Encode serializes a NovaServerPacket into a wire frame. If
+// params.IsEncrypted is true the frame is sealed with the codec's
+// transport key; otherwise it is emitted in the clear as a plain
+// handshake frame.
+func (c *Codec) Encode(pkt *NovaServerPacket, params novaproto.HeaderParams) ([]byte, error) {
 	if pkt == nil {
 		return nil, errors.New("c2s: nil packet")
 	}
@@ -79,93 +65,58 @@ func (c *Codec) Encode(pkt *NovaServerPacket) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	h := pkt.Header
-	return c.frame.Seal(&h, metaBytes, pkt.Payload)
+	h := headerFromParams(params)
+	if params.IsEncrypted {
+		return c.frame.Seal(&h, metaBytes, pkt.Payload)
+	}
+	return frame.MarshalPlain(&h, metaBytes, pkt.Payload)
 }
 
-// Decode parses and decrypts a wire frame into a NovaServerPacket.
-func (c *Codec) Decode(frameBytes []byte) (*NovaServerPacket, error) {
-	header, metaBytes, payload, err := c.frame.Open(frameBytes)
-	if err != nil {
-		return nil, err
+// Decode parses a wire frame into a NovaServerPacket. The returned
+// HeaderParams reflects the framing metadata that was on the wire.
+// Plain and encrypted frames are dispatched automatically based on the
+// IsEncrypted byte at offset 0.
+func (c *Codec) Decode(frameBytes []byte) (*NovaServerPacket, novaproto.HeaderParams, error) {
+	if len(frameBytes) < 1 {
+		return nil, novaproto.HeaderParams{}, errors.New("c2s: empty frame")
 	}
+
+	var (
+		header    *novaproto.Header
+		metaBytes []byte
+		payload   []byte
+		err       error
+	)
+	if frameBytes[0] == 0 {
+		header, metaBytes, payload, err = frame.UnmarshalPlain(frameBytes)
+	} else {
+		header, metaBytes, payload, err = c.frame.Open(frameBytes)
+	}
+	if err != nil {
+		return nil, novaproto.HeaderParams{}, err
+	}
+
 	var meta Metadata
 	if err := serializer.Unmarshal(metaBytes, &meta); err != nil {
-		return nil, err
+		return nil, novaproto.HeaderParams{}, err
 	}
-	return &NovaServerPacket{
-		Header:  *header,
-		Meta:    meta,
-		Payload: payload,
-	}, nil
+	return &NovaServerPacket{Meta: meta, Payload: payload}, paramsFromHeader(header), nil
 }
 
-// IsPlain reports whether a frame is a plaintext c2s frame, based on the
-// Header.IsEncrypted field at offset 0. Works without a Codec instance,
-// so it can be used during handshake before a transport key has been
-// negotiated:
-//
-//	if c2s.IsPlain(frame) {
-//	    pkt, err := c2s.DecodePlain(frame)
-//	} else {
-//	    pkt, err := codec.Decode(frame)
-//	}
-func IsPlain(frameBytes []byte) bool {
-	return len(frameBytes) >= 1 && frameBytes[0] == 0
+func headerFromParams(p novaproto.HeaderParams) novaproto.Header {
+	return novaproto.Header{
+		IsEncrypted:    p.IsEncrypted,
+		Nonce:          p.Nonce,
+		FragmentNum:    p.FragmentNum,
+		FragmentsCount: p.FragmentsCount,
+	}
 }
 
-// EncodePlain serializes a NovaServerPacket without encryption. Intended for
-// handshake frames sent before a transport key has been negotiated. The
-// payload is sent in the clear — do not put sensitive data here.
-func EncodePlain(pkt *NovaServerPacket) ([]byte, error) {
-	if pkt == nil {
-		return nil, errors.New("c2s: nil packet")
+func paramsFromHeader(h *novaproto.Header) novaproto.HeaderParams {
+	return novaproto.HeaderParams{
+		Nonce:          h.Nonce,
+		FragmentNum:    h.FragmentNum,
+		FragmentsCount: h.FragmentsCount,
+		IsEncrypted:    h.IsEncrypted,
 	}
-	if pkt.Meta.Timestamp == 0 {
-		pkt.Meta.Timestamp = time.Now().UnixNano()
-	}
-
-	metaBytes, err := serializer.Marshal(&pkt.Meta)
-	if err != nil {
-		return nil, err
-	}
-
-	h := pkt.Header
-	h.IsEncrypted = false
-	h.Magic = novaproto.Magic
-	h.Version = novaproto.Version
-	h.Length = uint32(len(metaBytes) + len(pkt.Payload))
-	h.Nonce = [novaproto.NonceSize]byte{}
-
-	return serializer.Marshal(&plainFrame{
-		Header:  h,
-		Meta:    metaBytes,
-		Payload: pkt.Payload,
-	})
-}
-
-// DecodePlain reverses EncodePlain.
-func DecodePlain(frameBytes []byte) (*NovaServerPacket, error) {
-	var pf plainFrame
-	if err := serializer.Unmarshal(frameBytes, &pf); err != nil {
-		return nil, err
-	}
-	if pf.Header.IsEncrypted {
-		return nil, errors.New("c2s: not a plain frame")
-	}
-	if pf.Header.Magic != novaproto.Magic {
-		return nil, errors.New("c2s: bad magic")
-	}
-	if pf.Header.Version != novaproto.Version {
-		return nil, errors.New("c2s: unsupported plain version")
-	}
-	var meta Metadata
-	if err := serializer.Unmarshal(pf.Meta, &meta); err != nil {
-		return nil, err
-	}
-	return &NovaServerPacket{
-		Header:  pf.Header,
-		Meta:    meta,
-		Payload: pf.Payload,
-	}, nil
 }

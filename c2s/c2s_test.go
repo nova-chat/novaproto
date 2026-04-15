@@ -20,6 +20,20 @@ func randKey(t *testing.T) []byte {
 	return k
 }
 
+func randParams(t *testing.T, encrypted bool) novaproto.HeaderParams {
+	t.Helper()
+	p := novaproto.HeaderParams{
+		FragmentsCount: 1,
+		IsEncrypted:    encrypted,
+	}
+	if encrypted {
+		if _, err := rand.Read(p.Nonce[:]); err != nil {
+			t.Fatalf("nonce: %v", err)
+		}
+	}
+	return p
+}
+
 func TestRoundtrip(t *testing.T) {
 	c, err := NewCodec(randKey(t), &novaproto.Options{
 		PadTo:     128,
@@ -39,13 +53,16 @@ func TestRoundtrip(t *testing.T) {
 		},
 		Payload: []byte("opaque inner blob"),
 	}
-	frame, err := c.Encode(pkt)
+	frame, err := c.Encode(pkt, randParams(t, true))
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
 	}
-	got, err := c.Decode(frame)
+	got, params, err := c.Decode(frame)
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
+	}
+	if !params.IsEncrypted {
+		t.Error("decoded IsEncrypted should be true")
 	}
 	if got.Meta != pkt.Meta {
 		t.Errorf("Meta: got %+v, want %+v", got.Meta, pkt.Meta)
@@ -56,6 +73,10 @@ func TestRoundtrip(t *testing.T) {
 }
 
 func TestPlainRoundtrip(t *testing.T) {
+	c, err := NewCodec(randKey(t), nil)
+	if err != nil {
+		t.Fatalf("NewCodec: %v", err)
+	}
 	pkt := &NovaServerPacket{
 		Meta: Metadata{
 			SenderID:    uuid.New(),
@@ -65,15 +86,14 @@ func TestPlainRoundtrip(t *testing.T) {
 		},
 		Payload: []byte("public handshake blob"),
 	}
-	frame, err := EncodePlain(pkt)
+	frame, err := c.Encode(pkt, randParams(t, false))
 	if err != nil {
-		t.Fatalf("EncodePlain: %v", err)
+		t.Fatalf("Encode plain: %v", err)
 	}
 
 	// Plain frames must carry Header.IsEncrypted=false at offset 0 so
-	// IsPlain-based dispatch works without any Codec. After the 1-byte
-	// flag and the 12-byte Nonce (zeroed in plain mode), the shared
-	// novaproto.Magic sits at offset 1+12.
+	// first-byte dispatch works without a key. After the IsEncrypted byte
+	// and the 12-byte Nonce, the shared novaproto.Magic sits at offset 13.
 	if frame[0] != 0 {
 		t.Errorf("wire IsEncrypted byte: got %#x, want 0", frame[0])
 	}
@@ -81,17 +101,17 @@ func TestPlainRoundtrip(t *testing.T) {
 	if magic := binary.BigEndian.Uint32(frame[magicOff : magicOff+4]); magic != novaproto.Magic {
 		t.Errorf("wire magic: got %#x, want %#x", magic, novaproto.Magic)
 	}
-	if !IsPlain(frame) {
-		t.Error("IsPlain should return true for a plain frame")
-	}
 	// The plaintext payload must be readable on the wire.
 	if !bytes.Contains(frame, pkt.Payload) {
 		t.Error("plain frame should contain payload in the clear")
 	}
 
-	got, err := DecodePlain(frame)
+	got, params, err := c.Decode(frame)
 	if err != nil {
-		t.Fatalf("DecodePlain: %v", err)
+		t.Fatalf("Decode plain: %v", err)
+	}
+	if params.IsEncrypted {
+		t.Error("decoded IsEncrypted should be false")
 	}
 	if got.Meta != pkt.Meta {
 		t.Errorf("Meta: got %+v, want %+v", got.Meta, pkt.Meta)
@@ -101,37 +121,9 @@ func TestPlainRoundtrip(t *testing.T) {
 	}
 }
 
-func TestPlainAndEncryptedDistinct(t *testing.T) {
-	c, err := NewCodec(randKey(t), nil)
-	if err != nil {
-		t.Fatalf("NewCodec: %v", err)
-	}
-	pkt := &NovaServerPacket{
-		Meta:    Metadata{SenderID: uuid.New(), TargetID: uuid.New()},
-		Payload: []byte("x"),
-	}
-
-	encFrame, err := c.Encode(pkt)
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
-	plainFrame, err := EncodePlain(pkt)
-	if err != nil {
-		t.Fatalf("EncodePlain: %v", err)
-	}
-
-	// Cross-decoding must fail — different wire formats.
-	if _, err := DecodePlain(encFrame); err == nil {
-		t.Error("DecodePlain accepted an encrypted frame")
-	}
-	if _, err := c.Decode(plainFrame); err == nil {
-		t.Error("Decode accepted a plain frame")
-	}
-}
-
-// TestMixedStreamDispatch simulates a receiver that gets a random mix of
-// plain and encrypted frames and must dispatch each to the right decoder
-// using only IsPlain.
+// TestMixedStreamDispatch sends a random mix of plain and encrypted
+// frames through a single Decode entry point and checks that each is
+// dispatched correctly based on the IsEncrypted byte.
 func TestMixedStreamDispatch(t *testing.T) {
 	codec, err := NewCodec(randKey(t), nil)
 	if err != nil {
@@ -158,33 +150,22 @@ func TestMixedStreamDispatch(t *testing.T) {
 		}
 		wantEncrypted := coin[0]&1 == 0
 
-		var frame []byte
-		if wantEncrypted {
-			frame, err = codec.Encode(pkt)
-		} else {
-			frame, err = EncodePlain(pkt)
-		}
+		frame, err := codec.Encode(pkt, randParams(t, wantEncrypted))
 		if err != nil {
 			t.Fatalf("[%d] encode: %v", i, err)
 		}
 
-		// Receiver side: has no prior knowledge of which mode was used.
-		isPlain := IsPlain(frame)
-		if isPlain == wantEncrypted {
-			t.Fatalf("[%d] IsPlain wrong: wantEncrypted=%v, isPlain=%v",
-				i, wantEncrypted, isPlain)
-		}
-
-		var got *NovaServerPacket
-		if isPlain {
-			got, err = DecodePlain(frame)
-			plainCount++
-		} else {
-			got, err = codec.Decode(frame)
-			encCount++
-		}
+		got, params, err := codec.Decode(frame)
 		if err != nil {
-			t.Fatalf("[%d] decode (isPlain=%v): %v", i, isPlain, err)
+			t.Fatalf("[%d] decode: %v", i, err)
+		}
+		if params.IsEncrypted != wantEncrypted {
+			t.Fatalf("[%d] IsEncrypted: got %v, want %v", i, params.IsEncrypted, wantEncrypted)
+		}
+		if params.IsEncrypted {
+			encCount++
+		} else {
+			plainCount++
 		}
 
 		if got.Meta != pkt.Meta {
@@ -195,8 +176,6 @@ func TestMixedStreamDispatch(t *testing.T) {
 		}
 	}
 
-	// Sanity-check that both branches actually exercised — a ~1/2^200
-	// chance of either counter being zero, basically impossible.
 	if plainCount == 0 || encCount == 0 {
 		t.Errorf("coin flip degenerate: plain=%d encrypted=%d", plainCount, encCount)
 	}
@@ -214,13 +193,13 @@ func TestTamperRejected(t *testing.T) {
 			TargetID: uuid.New(),
 		},
 		Payload: []byte("inner"),
-	})
+	}, randParams(t, true))
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
 	}
 	tampered := append([]byte(nil), frame...)
 	tampered[len(tampered)-1] ^= 0x01
-	if _, err := c.Decode(tampered); err == nil {
+	if _, _, err := c.Decode(tampered); err == nil {
 		t.Error("Decode accepted tampered frame")
 	}
 }

@@ -73,9 +73,10 @@ func NewCodec(key []byte, opts *novaproto.Options) (*Codec, error) {
 }
 
 // Seal encrypts (meta || payload) into a wire frame. The caller-supplied
-// header provides framing metadata (FragmentNum, FragmentsCount,
-// TotalSize); Seal overwrites IsEncrypted, Nonce, Magic, Version and
-// Length with frame-level values before marshalling.
+// header provides Nonce and caller-controlled framing metadata
+// (FragmentNum, FragmentsCount); Seal fills in IsEncrypted, Magic,
+// Version and Length before marshalling. Nonce MUST be unique per
+// (key, frame) — reusing it with the same key breaks AES-GCM.
 //
 // Wire layout: [header HeaderSize | prefix prefixLen | ciphertext].
 func (c *Codec) Seal(header *novaproto.Header, meta, payload []byte) ([]byte, error) {
@@ -94,9 +95,6 @@ func (c *Codec) Seal(header *novaproto.Header, meta, payload []byte) ([]byte, er
 	header.Magic = novaproto.Magic
 	header.Version = novaproto.Version
 	header.Length = uint32(len(inner) + c.aead.Overhead())
-	if _, err := io.ReadFull(rand.Reader, header.Nonce[:]); err != nil {
-		return nil, err
-	}
 
 	headerBuf, err := header.Marshal()
 	if err != nil {
