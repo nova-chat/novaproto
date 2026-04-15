@@ -37,7 +37,7 @@ func TestRoundtrip(t *testing.T) {
 		Meta: Metadata{
 			SenderID:    uuid.New(),
 			TargetID:    uuid.New(),
-			MessageType: MsgData,
+			MessageType: 0,
 			Timestamp:   1_700_000_000_000_000_000,
 		},
 		Payload: []byte("opaque inner blob"),
@@ -63,7 +63,7 @@ func TestPlainRoundtrip(t *testing.T) {
 		Meta: Metadata{
 			SenderID:    uuid.New(),
 			TargetID:    uuid.New(),
-			MessageType: MsgHandshake,
+			MessageType: 0,
 			Timestamp:   1_700_000_000_000_000_000,
 		},
 		Payload: []byte("public handshake blob"),
@@ -147,7 +147,7 @@ func TestMixedStreamDispatch(t *testing.T) {
 			Meta: Metadata{
 				SenderID:    uuid.New(),
 				TargetID:    uuid.New(),
-				MessageType: MessageType(i%6) + 1,
+				MessageType: uint32(i),
 				Timestamp:   1_700_000_000_000_000_000 + int64(i),
 			},
 			Payload: bytes.Repeat([]byte{byte(i)}, 16+i%48),

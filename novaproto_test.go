@@ -84,7 +84,7 @@ func TestClientServerClientRelay(t *testing.T) {
 		Meta: c2s.Metadata{
 			SenderID:    senderID,
 			TargetID:    targetID,
-			MessageType: c2s.MsgData,
+			MessageType: 0,
 		},
 		Payload: innerFrame,
 	}

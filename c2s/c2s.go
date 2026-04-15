@@ -39,22 +39,12 @@ type NovaServerPacket struct {
 type Metadata struct {
 	SenderID    uuid.UUID
 	TargetID    uuid.UUID
-	MessageType MessageType
+	MessageType uint32
 	Timestamp   int64
 	Encrypted   bool
 }
 
 type MessageType uint32
-
-const (
-	MsgUnknown MessageType = iota
-	MsgHandshake
-	MsgData
-	MsgAck
-	MsgControl
-	MsgPing
-	MsgPong
-)
 
 const metaSize = 16 + 16 + 4 + 8 + 1 // 45
 
@@ -198,7 +188,7 @@ func unmarshalMeta(buf []byte, m *Metadata) {
 	off += 16
 	copy(m.TargetID[:], buf[off:off+16])
 	off += 16
-	m.MessageType = MessageType(binary.BigEndian.Uint32(buf[off:]))
+	m.MessageType = binary.BigEndian.Uint32(buf[off:])
 	off += 4
 	m.Timestamp = int64(binary.BigEndian.Uint64(buf[off:]))
 	off += 8
