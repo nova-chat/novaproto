@@ -14,11 +14,11 @@ import (
 	"github.com/nova-chat/novaproto/serializer"
 )
 
-// Header is an alias for the unified framing header defined in
-// internal/frame. It carries fragmentation info (FragmentNum /
-// FragmentsCount / TotalSize) plus frame-level envelope fields that
-// the codec fills in automatically on Encode.
-type Header = frame.Header
+// Header is an alias for the unified framing header defined in the
+// top-level novaproto package. It carries fragmentation info
+// (FragmentNum / FragmentsCount / TotalSize) plus frame-level envelope
+// fields that the codec fills in automatically on Encode.
+type Header = novaproto.Header
 
 // NovaPacket is the user-facing end-to-end packet.
 type NovaPacket struct {

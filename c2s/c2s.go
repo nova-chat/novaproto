@@ -23,11 +23,11 @@ import (
 	"github.com/nova-chat/novaproto/serializer"
 )
 
-// Header is an alias for the unified framing header defined in
-// internal/frame. It carries fragmentation info (FragmentNum /
-// FragmentsCount / TotalSize) plus frame-level envelope fields that
-// the codec fills in automatically on Encode.
-type Header = frame.Header
+// Header is an alias for the unified framing header defined in the
+// top-level novaproto package. It carries fragmentation info
+// (FragmentNum / FragmentsCount / TotalSize) plus frame-level envelope
+// fields that the codec fills in automatically on Encode.
+type Header = novaproto.Header
 
 // NovaServerPacket is the client↔server packet.
 type NovaServerPacket struct {
@@ -47,7 +47,7 @@ type Metadata struct {
 // Plain wire layout:
 //
 //	[flag 1 | Header(HeaderSize) | metaLen 4 | payLen 4 | meta(metaLen) | payload(payLen)]
-const plainPrefixLen = 1 + frame.HeaderSize + 4 + 4
+const plainPrefixLen = 1 + novaproto.HeaderSize + 4 + 4
 
 // Codec encrypts and decrypts NovaServerPackets with the transport key.
 type Codec struct {
@@ -137,8 +137,8 @@ func EncodePlain(pkt *NovaServerPacket) ([]byte, error) {
 	out := make([]byte, plainPrefixLen+len(metaBytes)+len(pkt.Payload))
 	out[0] = byte(novaproto.FlagPlain)
 	copy(out[1:], headerBuf)
-	binary.BigEndian.PutUint32(out[1+frame.HeaderSize:], uint32(len(metaBytes)))
-	binary.BigEndian.PutUint32(out[1+frame.HeaderSize+4:], uint32(len(pkt.Payload)))
+	binary.BigEndian.PutUint32(out[1+novaproto.HeaderSize:], uint32(len(metaBytes)))
+	binary.BigEndian.PutUint32(out[1+novaproto.HeaderSize+4:], uint32(len(pkt.Payload)))
 	copy(out[plainPrefixLen:], metaBytes)
 	copy(out[plainPrefixLen+len(metaBytes):], pkt.Payload)
 	return out, nil
@@ -153,7 +153,7 @@ func DecodePlain(frameBytes []byte) (*NovaServerPacket, error) {
 		return nil, errors.New("c2s: not a plain frame")
 	}
 
-	header, err := frame.UnmarshalHeader(frameBytes[1 : 1+frame.HeaderSize])
+	header, err := novaproto.UnmarshalHeader(frameBytes[1 : 1+novaproto.HeaderSize])
 	if err != nil {
 		return nil, err
 	}
@@ -164,8 +164,8 @@ func DecodePlain(frameBytes []byte) (*NovaServerPacket, error) {
 		return nil, errors.New("c2s: unsupported plain version")
 	}
 
-	metaLen := binary.BigEndian.Uint32(frameBytes[1+frame.HeaderSize:])
-	payLen := binary.BigEndian.Uint32(frameBytes[1+frame.HeaderSize+4:])
+	metaLen := binary.BigEndian.Uint32(frameBytes[1+novaproto.HeaderSize:])
+	payLen := binary.BigEndian.Uint32(frameBytes[1+novaproto.HeaderSize+4:])
 	if int(plainPrefixLen)+int(metaLen)+int(payLen) != len(frameBytes) {
 		return nil, errors.New("c2s: plain length mismatch")
 	}

@@ -1,4 +1,4 @@
-package frame
+package novaproto
 
 import (
 	"testing"
@@ -6,7 +6,7 @@ import (
 
 func TestHeaderSizeMatchesSerialized(t *testing.T) {
 	h := &Header{
-		Nonce:          [nonceSize]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
+		Nonce:          [NonceSize]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
 		Magic:          0xDEADBEEF,
 		Version:        7,
 		Length:         1024,
@@ -25,7 +25,7 @@ func TestHeaderSizeMatchesSerialized(t *testing.T) {
 
 func TestHeaderRoundtrip(t *testing.T) {
 	in := &Header{
-		Nonce:          [nonceSize]byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 1, 2, 3, 4, 5, 6},
+		Nonce:          [NonceSize]byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 1, 2, 3, 4, 5, 6},
 		Magic:          0x4E4F5641,
 		Version:        1,
 		Length:         4096,
