@@ -3,10 +3,11 @@ package dhellman
 import (
 	"bytes"
 	"testing"
-
-	"github.com/nova-chat/novaproto/serializer"
 )
 
+// TestHandshakeRoundtrip walks both sides through the symmetric
+// X25519 + HKDF flow without involving any wire-message wrapper —
+// callers serialize PublicKey() bytes themselves now.
 func TestHandshakeRoundtrip(t *testing.T) {
 	alice, err := GenerateKeyPair()
 	if err != nil {
@@ -17,32 +18,14 @@ func TestHandshakeRoundtrip(t *testing.T) {
 		t.Fatalf("bob GenerateKeyPair: %v", err)
 	}
 
-	aliceHello := NewHelloMessage(alice)
-	bobHello := NewHelloMessage(bob)
+	alicePub := alice.PublicKey()
+	bobPub := bob.PublicKey()
 
-	aliceWire, err := serializer.Marshal(aliceHello)
-	if err != nil {
-		t.Fatalf("alice Marshal: %v", err)
-	}
-	bobWire, err := serializer.Marshal(bobHello)
-	if err != nil {
-		t.Fatalf("bob Marshal: %v", err)
-	}
-
-	var gotBob HelloMessage
-	if err := serializer.Unmarshal(bobWire, &gotBob); err != nil {
-		t.Fatalf("alice Unmarshal: %v", err)
-	}
-	var gotAlice HelloMessage
-	if err := serializer.Unmarshal(aliceWire, &gotAlice); err != nil {
-		t.Fatalf("bob Unmarshal: %v", err)
-	}
-
-	aliceShared, err := alice.ComputeShared(gotBob.PublicKey)
+	aliceShared, err := alice.ComputeShared(bobPub)
 	if err != nil {
 		t.Fatalf("alice ComputeShared: %v", err)
 	}
-	bobShared, err := bob.ComputeShared(gotAlice.PublicKey)
+	bobShared, err := bob.ComputeShared(alicePub)
 	if err != nil {
 		t.Fatalf("bob ComputeShared: %v", err)
 	}
@@ -50,7 +33,7 @@ func TestHandshakeRoundtrip(t *testing.T) {
 		t.Fatal("shared secrets differ")
 	}
 
-	salt := append(append([]byte{}, aliceHello.PublicKey[:]...), bobHello.PublicKey[:]...)
+	salt := append(append([]byte{}, alicePub[:]...), bobPub[:]...)
 	info := []byte("novaproto/dhellman/test")
 
 	aliceKey, err := DeriveKey(aliceShared, salt, info)
@@ -77,5 +60,11 @@ func TestComputeSharedRejectsBadPubKey(t *testing.T) {
 	var zero [PublicKeySize]byte
 	if _, err := kp.ComputeShared(zero); err == nil {
 		t.Error("accepted all-zero peer pubkey")
+	}
+}
+
+func TestDeriveKeyRejectsEmptyShared(t *testing.T) {
+	if _, err := DeriveKey(nil, []byte("salt"), []byte("info")); err == nil {
+		t.Error("expected error for empty shared secret")
 	}
 }

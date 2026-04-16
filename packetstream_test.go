@@ -254,6 +254,66 @@ func TestPacketStreamConcurrentSends(t *testing.T) {
 	}
 }
 
+// TestPacketStreamRecoversFromFrameDecryptError sends an encrypted
+// frame to a receiver that has no key. The first packet's reader
+// surfaces ErrFrameDecrypt, but the connection stays open and a
+// subsequent plain packet (after the sender drops its key) goes
+// through unharmed.
+func TestPacketStreamRecoversFromFrameDecryptError(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	senderCipher := novaproto.NewNovaWireStreamCipher(novaproto.NewNovaWireStream(a))
+	receiverCipher := novaproto.NewNovaWireStreamCipher(novaproto.NewNovaWireStream(b))
+	if err := senderCipher.SetKey(randKey(t)); err != nil {
+		t.Fatalf("sender SetKey: %v", err)
+	}
+	// receiver has no key on purpose
+
+	senderPS := novaproto.NewPacketStream(senderCipher)
+	receiverPS := novaproto.NewPacketStream(receiverCipher)
+
+	// 1. Send an encrypted packet — receiver will fail to decrypt.
+	go func() {
+		w := senderPS.SendPacket()
+		_, _ = w.Write([]byte("encrypted, you cannot read"))
+		_ = w.Close()
+	}()
+
+	r, err := receiverPS.ReceivePacket()
+	if err != nil {
+		t.Fatalf("first ReceivePacket: %v", err)
+	}
+	_, err = io.ReadAll(r)
+	if !errors.Is(err, novaproto.ErrFrameDecrypt) {
+		t.Fatalf("expected ErrFrameDecrypt on read, got %v", err)
+	}
+
+	// 2. Sender drops its key and sends a plain packet — should arrive
+	// without resurrecting the connection.
+	if err := senderCipher.SetKey(nil); err != nil {
+		t.Fatalf("sender SetKey(nil): %v", err)
+	}
+	go func() {
+		w := senderPS.SendPacket()
+		_, _ = w.Write([]byte("plain, this should arrive"))
+		_ = w.Close()
+	}()
+
+	r2, err := receiverPS.ReceivePacket()
+	if err != nil {
+		t.Fatalf("second ReceivePacket: %v", err)
+	}
+	got, err := io.ReadAll(r2)
+	if err != nil {
+		t.Fatalf("second ReadAll: %v", err)
+	}
+	if string(got) != "plain, this should arrive" {
+		t.Errorf("got %q, want plain text", got)
+	}
+}
+
 // TestPacketStreamConcurrentLargeAndSmall sends one big multi-frame
 // packet and several small single-frame packets concurrently from
 // independent goroutines. Verifies that small packets aren't blocked

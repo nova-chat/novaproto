@@ -100,7 +100,7 @@ func (c *NovaWireStreamCipher) ReadFrame() (FrameHeader, []byte, error) {
 	aead := c.aead
 	c.mu.RUnlock()
 	if aead == nil {
-		return hdr, nil, errors.New("wirecipher: encrypted frame received but no key installed")
+		return hdr, nil, fmt.Errorf("wirecipher: no key installed: %w", ErrFrameDecrypt)
 	}
 
 	nonce := deriveAEADNonce(hdr)
@@ -110,7 +110,7 @@ func (c *NovaWireStreamCipher) ReadFrame() (FrameHeader, []byte, error) {
 	}
 	plain, err := aead.Open(nil, nonce[:], content, aad)
 	if err != nil {
-		return hdr, nil, fmt.Errorf("wirecipher: AEAD open: %w", err)
+		return hdr, nil, fmt.Errorf("wirecipher: AEAD open: %w: %w", ErrFrameDecrypt, err)
 	}
 	return hdr, plain, nil
 }

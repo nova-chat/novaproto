@@ -78,17 +78,3 @@ func DeriveKey(shared, salt, info []byte) ([]byte, error) {
 	}
 	return hkdf.Key(sha256.New, shared, salt, string(info), SharedKeySize)
 }
-
-// HelloMessage is the single message type exchanged during the
-// handshake. Both peers send one, carrying their ephemeral public key.
-// The wire format is produced by the serializer package — callers pass
-// *HelloMessage through serializer.Marshal / serializer.Unmarshal
-// directly.
-type HelloMessage struct {
-	PublicKey [PublicKeySize]byte
-}
-
-// NewHelloMessage builds a HelloMessage from the keypair's public half.
-func NewHelloMessage(kp *KeyPair) *HelloMessage {
-	return &HelloMessage{PublicKey: kp.PublicKey()}
-}

@@ -194,6 +194,17 @@ func (ps *PacketStream) readLoop() {
 
 	inflight := make(map[uint32]*incomingPacket)
 
+	// failAll is the deathbed cleanup for genuinely fatal transport
+	// errors (EOF, broken connection, unrecoverable framing
+	// corruption). It wakes up every consumer blocked on an in-flight
+	// packet's pipe with the error, stores the error so subsequent
+	// ReceivePacket calls return it, and then the caller returns from
+	// readLoop (which closes ps.packets via the defer above).
+	//
+	// Per-packet errors (ErrFrameDecrypt, non-monotonic FrameNonce
+	// within one packet, consumer-side pipe write failure) do NOT
+	// call failAll — they fail just that one packet via failPacket
+	// below and the loop keeps reading.
 	failAll := func(err error) {
 		ps.readErr.Store(&err)
 		for _, p := range inflight {
@@ -201,9 +212,50 @@ func (ps *PacketStream) readLoop() {
 		}
 	}
 
+	// failPacket marks one packet (identified by hdr.PacketNonce) as
+	// failed with err, surfacing it to the consumer:
+	//   - if the packet is already in inflight, close its pipe with
+	//     err and mark it discarding so subsequent frames for it are
+	//     dropped silently
+	//   - if it's the first frame of a packet not yet known to the
+	//     consumer, create a phantom entry, push it to the packets
+	//     channel and immediately CloseWithError so the consumer's
+	//     first Read returns the error — this way the caller learns
+	//     about every dropped packet instead of having them vanish
+	// If hdr.IsTerminating is set, the inflight entry is removed too.
+	failPacket := func(hdr FrameHeader, err error) {
+		pkt, ok := inflight[hdr.PacketNonce]
+		if !ok {
+			pr, pw := io.Pipe()
+			pkt = &incomingPacket{
+				reader:         pr,
+				writer:         pw,
+				packetNonce:    hdr.PacketNonce,
+				lastFrameNonce: hdr.FrameNonce,
+				discarding:     true,
+			}
+			inflight[hdr.PacketNonce] = pkt
+			_ = pkt.writer.CloseWithError(err)
+			ps.packets <- pkt
+		} else if !pkt.discarding {
+			pkt.discarding = true
+			_ = pkt.writer.CloseWithError(err)
+		}
+		if hdr.IsTerminating {
+			delete(inflight, hdr.PacketNonce)
+		}
+	}
+
 	for {
 		hdr, content, err := ps.wire.ReadFrame()
 		if err != nil {
+			if errors.Is(err, ErrFrameDecrypt) {
+				// Per-frame decrypt failure: wire is positioned at
+				// the next frame, so we keep reading. The affected
+				// packet is failed for its consumer.
+				failPacket(hdr, err)
+				continue
+			}
 			failAll(err)
 			return
 		}
@@ -231,10 +283,12 @@ func (ps *PacketStream) readLoop() {
 			ps.packets <- pkt
 		} else {
 			if hdr.FrameNonce <= pkt.lastFrameNonce {
-				err := fmt.Errorf("packetstream: non-monotonic frame nonce %d after %d in packet %d",
+				// Per-packet invariant violation. Fail just this
+				// packet, keep the wire alive for unrelated packets.
+				invErr := fmt.Errorf("packetstream: non-monotonic frame nonce %d after %d in packet %d",
 					hdr.FrameNonce, pkt.lastFrameNonce, hdr.PacketNonce)
-				failAll(err)
-				return
+				failPacket(hdr, invErr)
+				continue
 			}
 			pkt.lastFrameNonce = hdr.FrameNonce
 		}
